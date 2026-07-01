@@ -1,0 +1,19 @@
+{
+  "name": "advanced-exif-tools",
+  "version": "1.0.0",
+  "description": "Advanced EXIF Tools — batch rename + metadata editor extension for Safelight.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "Anthony Reimche <anthonyreimche@gmail.com>",
+  "scripts": {
+    "build": "rolldown -c rolldown.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "rolldown test/roundtrip.ts -o test/roundtrip.mjs --format esm && node test/roundtrip.mjs"
+  },
+  "devDependencies": {
+    "rolldown": "^1.0.0",
+    "typescript": "^5.5.0",
+    "@types/react": "^18.3.0"
+  }
+}

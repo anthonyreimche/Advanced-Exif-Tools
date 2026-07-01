@@ -1,0 +1,4 @@
+node_modules/
+test/*.mjs
+*.log
+.DS_Store

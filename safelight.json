@@ -1,0 +1,14 @@
+{
+  "id": "anthonyreimche.advanced-exif-tools",
+  "name": "Advanced EXIF Tools",
+  "version": "1.0.0",
+  "description": "Batch and single file renaming with a Lightroom-style token system (sequence numbers, letters, capture date, camera and EXIF fields) plus an advanced metadata inspector and editor (creator, copyright, caption, keywords, capture time, GPS) written in place for JPEG/TIFF and to XMP sidecars for RAW.",
+  "author": "Anthony Reimche <anthonyreimche@gmail.com>",
+  "main": "dist/index.js",
+  "categories": ["Workflow", "Library"],
+  "keywords": ["rename", "batch rename", "exif", "metadata", "xmp", "numbering", "sequence", "copyright", "keywords"],
+  "homepage": "https://github.com/anthonyreimche/Advanced-Exif-Tools",
+  "repository": "anthonyreimche/Advanced-Exif-Tools",
+  "license": "MIT",
+  "minAppVersion": "2.5.0"
+}
