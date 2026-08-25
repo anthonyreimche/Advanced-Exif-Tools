@@ -4,8 +4,10 @@
 import { React, api, ui } from "../rt";
 import { useSelectedPhotos, Hint, Notice } from "../ui";
 import {
-  planRename, TOKEN_GROUPS, DEFAULT_OPTIONS, type RenameOptions, type CaseMode,
+  planRename, templateUsesSubsec, TOKEN_GROUPS, DEFAULT_OPTIONS,
+  type RenameOptions, type CaseMode,
 } from "./engine";
+import { harvestSubsec, missingSubsec, subsecMap } from "./subsec";
 import { applyRename, type ApplyOutcome } from "./apply";
 
 interface Preset {
@@ -17,6 +19,7 @@ const BUILTIN_PRESETS: Preset[] = [
   { name: "Original name", opts: { ...DEFAULT_OPTIONS, template: "{name}" } },
   { name: "Name + number", opts: { ...DEFAULT_OPTIONS, template: "{name}_{seq}" } },
   { name: "Date + number", opts: { ...DEFAULT_OPTIONS, template: "{date}_{seq}" } },
+  { name: "Timestamp + subseconds", opts: { ...DEFAULT_OPTIONS, template: "{yyyy}{mon}{day}_{hour}{min}{sec}.{subsec}" } },
   { name: "Year-month + number", opts: { ...DEFAULT_OPTIONS, template: "{yyyy}-{mon}_{seq}" } },
   { name: "Camera + number", opts: { ...DEFAULT_OPTIONS, template: "{model}_{seq}" } },
 ];
@@ -49,11 +52,35 @@ export function RenameTab(): React.ReactElement {
     setSummary(null);
   };
 
-  const plan = React.useMemo(() => planRename(targets, opts), [targets, opts]);
+  // {subsec} needs the files' own EXIF, read once per photo on demand. Until the
+  // harvest lands the plan is provisional: Apply stays off and the duplicate
+  // warning is held back so it can't flash on incomplete names.
+  const wantsSubsec = templateUsesSubsec(opts.template);
+  const [subsecTick, setSubsecTick] = React.useState(0);
+  const readingSubsec = wantsSubsec && missingSubsec(targets).length > 0;
+  React.useEffect(() => {
+    if (!wantsSubsec) return;
+    const missing = missingSubsec(targets);
+    if (!missing.length) return;
+    let live = true;
+    void harvestSubsec(missing).then(() => {
+      if (live) setSubsecTick((t) => t + 1);
+    });
+    return () => { live = false; };
+  }, [wantsSubsec, targets]);
+
+  const plan = React.useMemo(
+    () => planRename(targets, opts, subsecMap()),
+    [targets, opts, subsecTick],
+  );
   const active = plan.items.filter((it) => !it.skip && !it.unchanged);
   const skipped = plan.items.filter((it) => it.skip);
+  const noSubsecData =
+    wantsSubsec && !readingSubsec && targets.length > 0 &&
+    targets.every((p) => !subsecMap().get(p.id));
   const canApply =
-    targets.length > 0 && active.length > 0 && plan.duplicates.length === 0 && !applying;
+    targets.length > 0 && active.length > 0 && plan.duplicates.length === 0 &&
+    !applying && !readingSubsec;
 
   const insertToken = (t: string) => set({ template: opts.template + t });
 
@@ -196,7 +223,11 @@ export function RenameTab(): React.ReactElement {
           {plan.unknownTokens.length > 0 && (
             <Notice tone="warn">Unknown token{plan.unknownTokens.length > 1 ? "s" : ""}: {plan.unknownTokens.map((t) => `{${t}}`).join(", ")} — resolved to nothing.</Notice>
           )}
-          {plan.duplicates.length > 0 && (
+          {readingSubsec && <Hint>Reading subsecond timestamps…</Hint>}
+          {noSubsecData && (
+            <Hint>None of the selected files carry subsecond EXIF — {"{subsec}"} resolves to nothing.</Hint>
+          )}
+          {plan.duplicates.length > 0 && !readingSubsec && (
             <Notice tone="danger">Template produces duplicate names (add {"{seq}"} or {"{letter}"}): {plan.duplicates.slice(0, 3).join(", ")}{plan.duplicates.length > 3 ? "…" : ""}</Notice>
           )}
           {plan.needsTempPass && active.length > 0 && (

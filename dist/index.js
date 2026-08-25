@@ -140,6 +140,11 @@ const TOKEN_GROUPS = [
 				sample: "42"
 			},
 			{
+				insert: "{subsec}",
+				label: "Subseconds (ms)",
+				sample: "541"
+			},
+			{
 				insert: "{date}",
 				label: "Date (yyyymmdd)",
 				sample: "20260630"
@@ -206,6 +211,7 @@ const KNOWN_TOKENS = /* @__PURE__ */ new Set([
 	"hour",
 	"min",
 	"sec",
+	"subsec",
 	"date",
 	"time",
 	"make",
@@ -290,6 +296,12 @@ function resolveToken(name, arg, ctx) {
 		case "hour": return date ? two(date.getHours()) : "";
 		case "min": return date ? two(date.getMinutes()) : "";
 		case "sec": return date ? two(date.getSeconds()) : "";
+		case "subsec": {
+			const digits = (ctx.subsec?.get(photo.id) ?? "").replace(/\D/g, "");
+			if (!digits) return "";
+			const width = arg && /^\d+$/.test(arg) ? Math.max(1, +arg) : 3;
+			return digits.slice(0, width).padEnd(width, "0");
+		}
 		case "date": return date ? `${date.getFullYear()}${two(date.getMonth() + 1)}${two(date.getDate())}` : "";
 		case "time": return date ? `${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}` : "";
 		case "make": return exif.cameraMake ?? "";
@@ -307,11 +319,12 @@ const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
 *  `letter`/`LETTER` are case-sensitive; all other token names are matched
 *  case-insensitively. Unknown tokens resolve to "" (and are surfaced by
 *  collectUnknownTokens for a warning). */
-function renderTemplate(photo, index, opts) {
+function renderTemplate(photo, index, opts, subsecById) {
 	const ctx = {
 		photo,
 		index,
-		opts
+		opts,
+		subsec: subsecById
 	};
 	let base = sanitizeValue(opts.template.replace(TOKEN_RE, (_all, rawName, arg) => {
 		const val = resolveToken(rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase(), arg, ctx);
@@ -320,6 +333,12 @@ function renderTemplate(photo, index, opts) {
 	if (opts.caseMode === "lower") base = base.toLowerCase();
 	else if (opts.caseMode === "upper") base = base.toUpperCase();
 	return base;
+}
+/** Whether the template resolves {subsec} — the tab only harvests EXIF
+*  subseconds from files when it does. */
+function templateUsesSubsec(template) {
+	for (const m of template.matchAll(TOKEN_RE)) if (m[1].toLowerCase() === "subsec") return true;
+	return false;
 }
 /** Token ids present in the template that aren't recognised — for a live
 *  "unknown token" hint. `letter`/`LETTER` both fold to the known "letter". */
@@ -335,10 +354,10 @@ function collectUnknownTokens(template) {
 *  in-batch duplicate names and whether a temp pass is required to dodge
 *  target↔target name swaps. Virtual copies are marked skipped — they share the
 *  master's file, so core refuses to rename them. */
-function planRename(targets, opts) {
+function planRename(targets, opts, subsecById) {
 	const items = targets.map((photo, i) => {
 		const ext = splitExt(photo.filename).ext;
-		const newBase = renderTemplate(photo, i, opts);
+		const newBase = renderTemplate(photo, i, opts, subsecById);
 		const newName = ext ? `${newBase}.${ext}` : newBase;
 		const item = {
 			id: photo.id,
@@ -377,360 +396,6 @@ function planRename(targets, opts) {
 		needsTempPass,
 		unknownTokens: collectUnknownTokens(opts.template)
 	};
-}
-
-//#endregion
-//#region src/rename/apply.ts
-async function rename(id, base) {
-	const r = await api.catalog.renamePhoto(id, base);
-	return r.ok ? { ok: true } : {
-		ok: false,
-		reason: r.reason
-	};
-}
-async function applyRename(plan, onProgress) {
-	const active = plan.items.filter((it) => !it.skip && !it.unchanged);
-	const outcome = {
-		renamed: 0,
-		skipped: plan.items.filter((it) => it.skip).map((it) => ({
-			name: it.oldName,
-			reason: it.skip
-		})),
-		failed: []
-	};
-	const total = active.length;
-	let done = 0;
-	const report = (current) => onProgress?.({
-		done,
-		total,
-		current
-	});
-	const nonce = Date.now().toString(36);
-	if (plan.needsTempPass) {
-		const staged = /* @__PURE__ */ new Set();
-		for (let i = 0; i < active.length; i++) {
-			const it = active[i];
-			const r = await rename(it.id, `__aet_${nonce}_${i}`);
-			if (r.ok) staged.add(it.id);
-			else outcome.failed.push({
-				name: it.oldName,
-				reason: r.reason ?? "Rename failed."
-			});
-		}
-		for (const it of active) {
-			if (!staged.has(it.id)) continue;
-			report(it.newName);
-			const r = await rename(it.id, it.newBase);
-			if (r.ok) outcome.renamed++;
-			else {
-				const origBase = it.oldName.replace(/\.[^.]+$/, "");
-				await rename(it.id, origBase);
-				outcome.failed.push({
-					name: it.oldName,
-					reason: r.reason ?? "Rename failed."
-				});
-			}
-			done++;
-		}
-	} else for (const it of active) {
-		report(it.newName);
-		const r = await rename(it.id, it.newBase);
-		if (r.ok) outcome.renamed++;
-		else outcome.failed.push({
-			name: it.oldName,
-			reason: r.reason ?? "Rename failed."
-		});
-		done++;
-	}
-	report("");
-	return outcome;
-}
-
-//#endregion
-//#region src/rename/RenameTab.tsx
-const BUILTIN_PRESETS = [
-	{
-		name: "Original name",
-		opts: {
-			...DEFAULT_OPTIONS,
-			template: "{name}"
-		}
-	},
-	{
-		name: "Name + number",
-		opts: {
-			...DEFAULT_OPTIONS,
-			template: "{name}_{seq}"
-		}
-	},
-	{
-		name: "Date + number",
-		opts: {
-			...DEFAULT_OPTIONS,
-			template: "{date}_{seq}"
-		}
-	},
-	{
-		name: "Year-month + number",
-		opts: {
-			...DEFAULT_OPTIONS,
-			template: "{yyyy}-{mon}_{seq}"
-		}
-	},
-	{
-		name: "Camera + number",
-		opts: {
-			...DEFAULT_OPTIONS,
-			template: "{model}_{seq}"
-		}
-	}
-];
-const OPTS_KEY = "rename.options";
-const PRESETS_KEY = "rename.presets";
-const PREVIEW_LIMIT = 8;
-function RenameTab() {
-	const { Button, TextInput, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, tokens } = ui;
-	const targets = useSelectedPhotos();
-	const [opts, setOpts] = React.useState(() => api.settings.get(OPTS_KEY, DEFAULT_OPTIONS));
-	const [userPresets, setUserPresets] = React.useState(() => api.settings.get(PRESETS_KEY, []));
-	const [applying, setApplying] = React.useState(false);
-	const [prog, setProg] = React.useState(null);
-	const [summary, setSummary] = React.useState(null);
-	const [presetName, setPresetName] = React.useState("");
-	const set = (patch) => {
-		setOpts((prev) => {
-			const next = {
-				...prev,
-				...patch
-			};
-			api.settings.set(OPTS_KEY, next);
-			return next;
-		});
-		setSummary(null);
-	};
-	const plan = React.useMemo(() => planRename(targets, opts), [targets, opts]);
-	const active = plan.items.filter((it) => !it.skip && !it.unchanged);
-	const skipped = plan.items.filter((it) => it.skip);
-	const canApply = targets.length > 0 && active.length > 0 && plan.duplicates.length === 0 && !applying;
-	const insertToken = (t) => set({ template: opts.template + t });
-	const savePreset = () => {
-		const name = presetName.trim();
-		if (!name) return;
-		const next = [...userPresets.filter((p) => p.name !== name), {
-			name,
-			opts
-		}];
-		setUserPresets(next);
-		api.settings.set(PRESETS_KEY, next);
-	};
-	const deletePreset = () => {
-		const name = presetName.trim();
-		const next = userPresets.filter((p) => p.name !== name);
-		setUserPresets(next);
-		api.settings.set(PRESETS_KEY, next);
-		setPresetName("");
-	};
-	const applyPreset = (name) => {
-		const p = [...BUILTIN_PRESETS, ...userPresets].find((x) => x.name === name);
-		if (p) {
-			set({ ...p.opts });
-			setPresetName(name);
-		}
-	};
-	const savedMatch = userPresets.some((p) => p.name === presetName.trim());
-	const run = async () => {
-		setApplying(true);
-		setSummary(null);
-		try {
-			setSummary(await applyRename(plan, (p) => setProg({
-				done: p.done,
-				total: p.total
-			})));
-		} finally {
-			setApplying(false);
-			setProg(null);
-		}
-	};
-	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: "Template" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(TextInput, {
-		value: opts.template,
-		onChange: (v) => set({ template: v }),
-		style: { fontFamily: tokens.fontMono },
-		placeholder: "{name}_{seq}"
-	}), /* @__PURE__ */ React.createElement(Hint, null, "Click to add a token. Anything else is kept as typed."), TOKEN_GROUPS.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.group }, /* @__PURE__ */ React.createElement("div", { style: {
-		color: tokens.textMuted,
-		fontSize: 10,
-		textTransform: "uppercase",
-		letterSpacing: .4,
-		marginBottom: 4
-	} }, g.group), /* @__PURE__ */ React.createElement(Row, {
-		gap: 4,
-		wrap: true
-	}, g.tokens.map((t) => /* @__PURE__ */ React.createElement("button", {
-		key: t.insert,
-		onClick: () => insertToken(t.insert),
-		title: `${t.label} — e.g. ${t.sample}`,
-		style: {
-			font: "inherit",
-			fontSize: 11,
-			fontFamily: tokens.fontMono,
-			padding: "2px 6px",
-			borderRadius: 4,
-			border: `1px solid ${tokens.border}`,
-			background: tokens.surface2,
-			color: tokens.textSecondary,
-			cursor: "pointer"
-		}
-	}, t.insert))))))), /* @__PURE__ */ React.createElement(Section, { title: "Numbering" }, /* @__PURE__ */ React.createElement(Row, {
-		gap: 10,
-		wrap: true
-	}, /* @__PURE__ */ React.createElement(Field, { label: "Start" }, /* @__PURE__ */ React.createElement(NumberInput, {
-		value: opts.seqStart,
-		onChange: (v) => set({ seqStart: Math.trunc(v) }),
-		min: 0,
-		step: 1,
-		width: 64
-	})), /* @__PURE__ */ React.createElement(Field, { label: "Step" }, /* @__PURE__ */ React.createElement(NumberInput, {
-		value: opts.seqStep,
-		onChange: (v) => set({ seqStep: Math.trunc(v) || 1 }),
-		min: 1,
-		step: 1,
-		width: 64
-	})), /* @__PURE__ */ React.createElement(Field, { label: "Digits" }, /* @__PURE__ */ React.createElement(NumberInput, {
-		value: opts.seqPad,
-		onChange: (v) => set({ seqPad: Math.max(1, Math.trunc(v)) }),
-		min: 1,
-		max: 8,
-		step: 1,
-		width: 64
-	})), /* @__PURE__ */ React.createElement(Field, { label: "Case" }, /* @__PURE__ */ React.createElement(SegmentedControl, {
-		value: opts.caseMode,
-		onChange: (v) => set({ caseMode: v }),
-		options: [
-			{
-				value: "asis",
-				label: "Aa"
-			},
-			{
-				value: "lower",
-				label: "aa"
-			},
-			{
-				value: "upper",
-				label: "AA"
-			}
-		]
-	})))), /* @__PURE__ */ React.createElement(Section, { title: "Presets" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Select, {
-		value: "",
-		onChange: applyPreset,
-		placeholder: "Load a preset…",
-		groups: [{
-			title: "Built-in",
-			items: BUILTIN_PRESETS.map((p) => ({
-				value: p.name,
-				label: p.name
-			}))
-		}, ...userPresets.length ? [{
-			title: "Saved",
-			items: userPresets.map((p) => ({
-				value: p.name,
-				label: p.name
-			}))
-		}] : []]
-	}), /* @__PURE__ */ React.createElement(Row, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement(TextInput, {
-		value: presetName,
-		onChange: setPresetName,
-		placeholder: "Save current as…"
-	})), /* @__PURE__ */ React.createElement(Button, {
-		size: "sm",
-		onClick: savePreset,
-		disabled: !presetName.trim()
-	}, savedMatch ? "Update" : "Save"), savedMatch && /* @__PURE__ */ React.createElement(Button, {
-		size: "sm",
-		variant: "danger",
-		onClick: deletePreset
-	}, "Delete")))), /* @__PURE__ */ React.createElement(Section, { title: `Preview (${active.length} to rename)` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Select one or more photos in the grid."), plan.unknownTokens.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, "Unknown token", plan.unknownTokens.length > 1 ? "s" : "", ": ", plan.unknownTokens.map((t) => `{${t}}`).join(", "), " — resolved to nothing."), plan.duplicates.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, "Template produces duplicate names (add ", "{seq}", " or ", "{letter}", "): ", plan.duplicates.slice(0, 3).join(", "), plan.duplicates.length > 3 ? "…" : ""), plan.needsTempPass && active.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "Names overlap the current set — a safe two-pass rename will be used."), active.length > 0 && /* @__PURE__ */ React.createElement("div", { style: {
-		fontFamily: tokens.fontMono,
-		fontSize: 11,
-		lineHeight: 1.7
-	} }, active.slice(0, PREVIEW_LIMIT).map((it) => /* @__PURE__ */ React.createElement("div", {
-		key: it.id,
-		style: {
-			display: "flex",
-			gap: 6,
-			alignItems: "center",
-			whiteSpace: "nowrap",
-			overflow: "hidden"
-		}
-	}, /* @__PURE__ */ React.createElement("span", { style: {
-		color: tokens.textMuted,
-		overflow: "hidden",
-		textOverflow: "ellipsis"
-	} }, it.oldName), /* @__PURE__ */ React.createElement("span", { style: { color: tokens.textMuted } }, "→"), /* @__PURE__ */ React.createElement("span", { style: {
-		color: tokens.textPrimary,
-		overflow: "hidden",
-		textOverflow: "ellipsis"
-	} }, it.newName))), active.length > PREVIEW_LIMIT && /* @__PURE__ */ React.createElement("div", { style: { color: tokens.textMuted } }, "…and ", active.length - PREVIEW_LIMIT, " more")), skipped.length > 0 && /* @__PURE__ */ React.createElement(Hint, null, skipped.length, " skipped: ", skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; "), skipped.length > 3 ? "…" : ""))), prog && /* @__PURE__ */ React.createElement(ProgressBar, { value: prog.total ? prog.done / prog.total : 0 }), summary && /* @__PURE__ */ React.createElement(Notice, { tone: summary.failed.length ? "warn" : "ok" }, "Renamed ", summary.renamed, summary.skipped.length ? `, skipped ${summary.skipped.length}` : "", summary.failed.length ? `, failed ${summary.failed.length}: ${summary.failed.slice(0, 2).map((f) => f.reason).join("; ")}` : "."), /* @__PURE__ */ React.createElement(Button, {
-		variant: "primary",
-		full: true,
-		disabled: !canApply,
-		onClick: run
-	}, applying ? "Renaming…" : `Rename ${active.length || ""} file${active.length === 1 ? "" : "s"}`));
-}
-
-//#endregion
-//#region src/metadata/model.ts
-const pad2 = (n) => n < 10 ? "0" + n : String(n);
-/** Format a Date as EXIF "YYYY:MM:DD HH:MM:SS" in local time. */
-function formatExifDate(d) {
-	return `${d.getFullYear()}:${pad2(d.getMonth() + 1)}:${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-}
-/** Parse EXIF "YYYY:MM:DD HH:MM:SS" to a Date, or null. */
-function parseExifDate(s) {
-	if (!s) return null;
-	const m = s.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
-	if (!m) return null;
-	const [, y, mo, d, h, mi, se] = m;
-	const dt = new Date(+y, +mo - 1, +d, +h, +mi, +se);
-	return Number.isNaN(dt.getTime()) ? null : dt;
-}
-/** Resolve the DateOp to a concrete "YYYY:MM:DD HH:MM:SS" for one photo, or
-*  null when there's nothing to write (no-op, or a shift with no base time). */
-function resolveDate(op, photo) {
-	if (op.kind === "none") return null;
-	if (op.kind === "set") return op.value || null;
-	const base = parseExifDate(photo.exif.dateTimeOriginal);
-	if (!base) return null;
-	return formatExifDate(new Date(base.getTime() + op.seconds * 1e3));
-}
-/** Decimal degrees → [deg, min, sec] rationals + hemisphere ref char. */
-function decimalToDms(value, positive, negative) {
-	const ref = value < 0 ? negative : positive;
-	const abs = Math.abs(value);
-	const deg = Math.floor(abs);
-	const minFloat = (abs - deg) * 60;
-	const min = Math.floor(minFloat);
-	const sec = (minFloat - min) * 60;
-	return {
-		ref,
-		pairs: [
-			[deg, 1],
-			[min, 1],
-			[Math.round(sec * 1e3), 1e3]
-		]
-	};
-}
-/** Current editable values for a photo, for prefill in the single-photo case. */
-function currentMeta(photo) {
-	const e = photo.exif;
-	const meta = {
-		artist: e.artist ?? "",
-		copyright: e.copyright ?? "",
-		description: e.imageDescription ?? "",
-		keywords: photo.keywords ?? []
-	};
-	if (e.gpsLatitude != null) meta.gpsLat = e.gpsLatitude;
-	if (e.gpsLongitude != null) meta.gpsLon = e.gpsLongitude;
-	return meta;
 }
 
 //#endregion
@@ -1067,6 +732,648 @@ function u32Bytes(n, little) {
 	const b = /* @__PURE__ */ new Uint8Array(4);
 	new DataView(b.buffer).setUint32(0, n >>> 0, little);
 	return b;
+}
+
+//#endregion
+//#region src/metadata/exif-read.ts
+/** Locate the TIFF header a format's EXIF lives in: byte 0 for TIFF/RAW-TIFF,
+*  or just past "Exif\0\0" in a JPEG APP1. Returns -1 when there's no EXIF. */
+function findExifBase(buf) {
+	if (buf.length < 4) return -1;
+	const head = buf[0] << 8 | buf[1];
+	if (head === 18761 || head === 19789) return 0;
+	if (head !== 65496) return -1;
+	let off = 2;
+	while (off + 4 <= buf.length) {
+		if (buf[off] !== 255) break;
+		const marker = buf[off + 1];
+		if (marker === 218 || marker === 217) break;
+		const len = buf[off + 2] << 8 | buf[off + 3];
+		if (marker === 225 && off + 10 <= buf.length) {
+			const sig = off + 4;
+			if (buf[sig] === 69 && buf[sig + 1] === 120 && buf[sig + 2] === 105 && buf[sig + 3] === 102 && buf[sig + 4] === 0 && buf[sig + 5] === 0) return sig + 6;
+		}
+		off += 2 + len;
+	}
+	return -1;
+}
+const TYPE_NAME = {
+	1: "BYTE",
+	2: "ASCII",
+	3: "SHORT",
+	4: "LONG",
+	5: "RATIONAL",
+	6: "SBYTE",
+	7: "UNDEFINED",
+	8: "SSHORT",
+	9: "SLONG",
+	10: "SRATIONAL",
+	11: "FLOAT",
+	12: "DOUBLE"
+};
+const BASE_TAGS = {
+	256: "ImageWidth",
+	257: "ImageLength",
+	258: "BitsPerSample",
+	259: "Compression",
+	262: "PhotometricInterpretation",
+	270: "ImageDescription",
+	271: "Make",
+	272: "Model",
+	273: "StripOffsets",
+	274: "Orientation",
+	277: "SamplesPerPixel",
+	278: "RowsPerStrip",
+	279: "StripByteCounts",
+	282: "XResolution",
+	283: "YResolution",
+	296: "ResolutionUnit",
+	305: "Software",
+	306: "DateTime",
+	315: "Artist",
+	318: "WhitePoint",
+	319: "PrimaryChromaticities",
+	513: "ThumbnailOffset",
+	514: "ThumbnailLength",
+	529: "YCbCrCoefficients",
+	531: "YCbCrPositioning",
+	532: "ReferenceBlackWhite",
+	33432: "Copyright",
+	34665: "ExifIFD",
+	34853: "GPSIFD",
+	40965: "InteropIFD",
+	50341: "PrintIM"
+};
+const EXIF_TAGS = {
+	33434: "ExposureTime",
+	33437: "FNumber",
+	34850: "ExposureProgram",
+	34855: "ISO",
+	34864: "SensitivityType",
+	34866: "RecommendedExposureIndex",
+	36864: "ExifVersion",
+	36867: "DateTimeOriginal",
+	36868: "DateTimeDigitized",
+	36880: "OffsetTime",
+	36881: "OffsetTimeOriginal",
+	37121: "ComponentsConfiguration",
+	37520: "SubSecTime",
+	37521: "SubSecTimeOriginal",
+	37522: "SubSecTimeDigitized",
+	37377: "ShutterSpeedValue",
+	37378: "ApertureValue",
+	37380: "ExposureBias",
+	37381: "MaxApertureValue",
+	37382: "SubjectDistance",
+	37383: "MeteringMode",
+	37384: "LightSource",
+	37385: "Flash",
+	37386: "FocalLength",
+	37500: "MakerNote",
+	37510: "UserComment",
+	40960: "FlashpixVersion",
+	40961: "ColorSpace",
+	40962: "PixelXDimension",
+	40963: "PixelYDimension",
+	40965: "InteropIFD",
+	41986: "ExposureMode",
+	41987: "WhiteBalance",
+	41988: "DigitalZoomRatio",
+	41989: "FocalLengthIn35mm",
+	41990: "SceneCaptureType",
+	41992: "Contrast",
+	41993: "Saturation",
+	41994: "Sharpness",
+	42016: "ImageUniqueID",
+	42033: "BodySerialNumber",
+	42034: "LensInfo",
+	42035: "LensMake",
+	42036: "LensModel",
+	42037: "LensSerialNumber"
+};
+const GPS_TAGS = {
+	0: "GPSVersionID",
+	1: "GPSLatitudeRef",
+	2: "GPSLatitude",
+	3: "GPSLongitudeRef",
+	4: "GPSLongitude",
+	5: "GPSAltitudeRef",
+	6: "GPSAltitude",
+	7: "GPSTimeStamp",
+	18: "GPSMapDatum",
+	29: "GPSDateStamp"
+};
+const INTEROP_TAGS = {
+	1: "InteroperabilityIndex",
+	2: "InteroperabilityVersion"
+};
+function nameFor(ifd, tag) {
+	return (ifd === "Exif" ? EXIF_TAGS : ifd === "GPS" ? GPS_TAGS : ifd === "Interop" ? INTEROP_TAGS : BASE_TAGS)[tag] ?? `Tag 0x${tag.toString(16).padStart(4, "0")}`;
+}
+function formatValue(t, little) {
+	const b = t.bytes;
+	if (!b) return t.tag === 273 || t.tag === 513 ? "(image data)" : "";
+	const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+	const cap = 16;
+	switch (t.type) {
+		case 2: {
+			let end = b.length;
+			while (end > 0 && b[end - 1] === 0) end--;
+			return new TextDecoder("utf-8").decode(b.subarray(0, end)).trim();
+		}
+		case 1:
+		case 7: {
+			const n = Math.min(t.count, 64);
+			return Array.from(b.subarray(0, n), (x) => x.toString(16).padStart(2, "0")).join(" ") + (t.count > n ? " …" : "");
+		}
+		case 3:
+		case 8: {
+			const n = Math.min(t.count, cap);
+			const out = [];
+			for (let i = 0; i < n; i++) out.push(t.type === 8 ? dv.getInt16(i * 2, little) : dv.getUint16(i * 2, little));
+			return out.join(", ") + (t.count > n ? " …" : "");
+		}
+		case 4:
+		case 9: {
+			const n = Math.min(t.count, cap);
+			const out = [];
+			for (let i = 0; i < n; i++) out.push(t.type === 9 ? dv.getInt32(i * 4, little) : dv.getUint32(i * 4, little));
+			return out.join(", ") + (t.count > n ? " …" : "");
+		}
+		case 5:
+		case 10: {
+			const n = Math.min(t.count, cap);
+			const out = [];
+			for (let i = 0; i < n; i++) {
+				const num = t.type === 10 ? dv.getInt32(i * 8, little) : dv.getUint32(i * 8, little);
+				const den = t.type === 10 ? dv.getInt32(i * 8 + 4, little) : dv.getUint32(i * 8 + 4, little);
+				out.push(den === 0 ? `${num}/0` : Number.isInteger(num / den) ? `${num / den}` : `${num}/${den}`);
+			}
+			return out.join(", ") + (t.count > n ? " …" : "");
+		}
+		default: return `(${TYPE_NAME[t.type] ?? t.type} ×${t.count})`;
+	}
+}
+function dumpIfd(node, ifd, little, out) {
+	if (!node) return;
+	const rows = node.tags.map((t) => ({
+		tag: t.tag,
+		name: nameFor(ifd, t.tag),
+		value: formatValue(t, little)
+	})).sort((a, b) => a.tag - b.tag);
+	for (const r of rows) out.push({
+		ifd,
+		tag: r.tag,
+		name: r.name,
+		value: r.value
+	});
+}
+/** Decode every kept tag from `buf` into a grouped, human-readable list. */
+function readAllTags(buf) {
+	const base = findExifBase(buf);
+	if (base < 0) return [];
+	const tiff = parseTiff(buf, base);
+	if (!tiff) return [];
+	const out = [];
+	dumpIfd(tiff.ifd0, "IFD0", tiff.little, out);
+	dumpIfd(tiff.ifd0.exif, "Exif", tiff.little, out);
+	dumpIfd(tiff.ifd0.gps, "GPS", tiff.little, out);
+	dumpIfd(tiff.ifd0.interop, "Interop", tiff.little, out);
+	dumpIfd(tiff.ifd0.next, "IFD1", tiff.little, out);
+	return out;
+}
+
+//#endregion
+//#region src/rename/subsec.ts
+const TAG_SUBSEC = 37520;
+const TAG_SUBSEC_ORIGINAL = 37521;
+const TAG_SUBSEC_DIGITIZED = 37522;
+const SCAN_BYTES = 1 << 20;
+/** The subsecond digit string for the capture moment, preferring the tag that
+*  pairs with DateTimeOriginal (which the date tokens render). "" when the
+*  buffer has none — including truncated or non-EXIF bytes. */
+function extractSubsec(buf) {
+	try {
+		const base = findExifBase(buf);
+		if (base < 0) return "";
+		const exif = parseTiff(buf, base)?.ifd0.exif;
+		if (!exif) return "";
+		return getAscii(exif, TAG_SUBSEC_ORIGINAL) ?? getAscii(exif, TAG_SUBSEC_DIGITIZED) ?? getAscii(exif, TAG_SUBSEC) ?? "";
+	} catch {
+		return "";
+	}
+}
+const cache = /* @__PURE__ */ new Map();
+/** Read-only view of everything harvested so far, keyed by photo id — pass it
+*  to planRename/renderTemplate. */
+function subsecMap() {
+	return cache;
+}
+/** The photos still needing a harvest before their {subsec} can resolve.
+*  Virtual copies are excluded: the planner skips them anyway. */
+function missingSubsec(photos) {
+	return photos.filter((p) => !p.copyOf && !cache.has(p.id));
+}
+async function readSubsec(photo) {
+	try {
+		const handle = photo.fileHandle ?? await photo.directoryHandle?.getFileHandle(photo.filename);
+		if (!handle) return "";
+		const file = await handle.getFile();
+		return extractSubsec(new Uint8Array(await file.slice(0, SCAN_BYTES).arrayBuffer()));
+	} catch {
+		return "";
+	}
+}
+const HARVEST_CONCURRENCY = 8;
+/** Fill the cache for `photos`. Files without subsecond EXIF cache "" so they
+*  are only ever read once. */
+async function harvestSubsec(photos) {
+	const queue = [...photos];
+	const worker = async () => {
+		for (let p = queue.shift(); p; p = queue.shift()) cache.set(p.id, await readSubsec(p));
+	};
+	await Promise.all(Array.from({ length: HARVEST_CONCURRENCY }, worker));
+}
+
+//#endregion
+//#region src/rename/apply.ts
+async function rename(id, base) {
+	const r = await api.catalog.renamePhoto(id, base);
+	return r.ok ? { ok: true } : {
+		ok: false,
+		reason: r.reason
+	};
+}
+async function applyRename(plan, onProgress) {
+	const active = plan.items.filter((it) => !it.skip && !it.unchanged);
+	const outcome = {
+		renamed: 0,
+		skipped: plan.items.filter((it) => it.skip).map((it) => ({
+			name: it.oldName,
+			reason: it.skip
+		})),
+		failed: []
+	};
+	const total = active.length;
+	let done = 0;
+	const report = (current) => onProgress?.({
+		done,
+		total,
+		current
+	});
+	const nonce = Date.now().toString(36);
+	if (plan.needsTempPass) {
+		const staged = /* @__PURE__ */ new Set();
+		for (let i = 0; i < active.length; i++) {
+			const it = active[i];
+			const r = await rename(it.id, `__aet_${nonce}_${i}`);
+			if (r.ok) staged.add(it.id);
+			else outcome.failed.push({
+				name: it.oldName,
+				reason: r.reason ?? "Rename failed."
+			});
+		}
+		for (const it of active) {
+			if (!staged.has(it.id)) continue;
+			report(it.newName);
+			const r = await rename(it.id, it.newBase);
+			if (r.ok) outcome.renamed++;
+			else {
+				const origBase = it.oldName.replace(/\.[^.]+$/, "");
+				await rename(it.id, origBase);
+				outcome.failed.push({
+					name: it.oldName,
+					reason: r.reason ?? "Rename failed."
+				});
+			}
+			done++;
+		}
+	} else for (const it of active) {
+		report(it.newName);
+		const r = await rename(it.id, it.newBase);
+		if (r.ok) outcome.renamed++;
+		else outcome.failed.push({
+			name: it.oldName,
+			reason: r.reason ?? "Rename failed."
+		});
+		done++;
+	}
+	report("");
+	return outcome;
+}
+
+//#endregion
+//#region src/rename/RenameTab.tsx
+const BUILTIN_PRESETS = [
+	{
+		name: "Original name",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{name}"
+		}
+	},
+	{
+		name: "Name + number",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{name}_{seq}"
+		}
+	},
+	{
+		name: "Date + number",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{date}_{seq}"
+		}
+	},
+	{
+		name: "Timestamp + subseconds",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{yyyy}{mon}{day}_{hour}{min}{sec}.{subsec}"
+		}
+	},
+	{
+		name: "Year-month + number",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{yyyy}-{mon}_{seq}"
+		}
+	},
+	{
+		name: "Camera + number",
+		opts: {
+			...DEFAULT_OPTIONS,
+			template: "{model}_{seq}"
+		}
+	}
+];
+const OPTS_KEY = "rename.options";
+const PRESETS_KEY = "rename.presets";
+const PREVIEW_LIMIT = 8;
+function RenameTab() {
+	const { Button, TextInput, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, tokens } = ui;
+	const targets = useSelectedPhotos();
+	const [opts, setOpts] = React.useState(() => api.settings.get(OPTS_KEY, DEFAULT_OPTIONS));
+	const [userPresets, setUserPresets] = React.useState(() => api.settings.get(PRESETS_KEY, []));
+	const [applying, setApplying] = React.useState(false);
+	const [prog, setProg] = React.useState(null);
+	const [summary, setSummary] = React.useState(null);
+	const [presetName, setPresetName] = React.useState("");
+	const set = (patch) => {
+		setOpts((prev) => {
+			const next = {
+				...prev,
+				...patch
+			};
+			api.settings.set(OPTS_KEY, next);
+			return next;
+		});
+		setSummary(null);
+	};
+	const wantsSubsec = templateUsesSubsec(opts.template);
+	const [subsecTick, setSubsecTick] = React.useState(0);
+	const readingSubsec = wantsSubsec && missingSubsec(targets).length > 0;
+	React.useEffect(() => {
+		if (!wantsSubsec) return;
+		const missing = missingSubsec(targets);
+		if (!missing.length) return;
+		let live = true;
+		harvestSubsec(missing).then(() => {
+			if (live) setSubsecTick((t) => t + 1);
+		});
+		return () => {
+			live = false;
+		};
+	}, [wantsSubsec, targets]);
+	const plan = React.useMemo(() => planRename(targets, opts, subsecMap()), [
+		targets,
+		opts,
+		subsecTick
+	]);
+	const active = plan.items.filter((it) => !it.skip && !it.unchanged);
+	const skipped = plan.items.filter((it) => it.skip);
+	const noSubsecData = wantsSubsec && !readingSubsec && targets.length > 0 && targets.every((p) => !subsecMap().get(p.id));
+	const canApply = targets.length > 0 && active.length > 0 && plan.duplicates.length === 0 && !applying && !readingSubsec;
+	const insertToken = (t) => set({ template: opts.template + t });
+	const savePreset = () => {
+		const name = presetName.trim();
+		if (!name) return;
+		const next = [...userPresets.filter((p) => p.name !== name), {
+			name,
+			opts
+		}];
+		setUserPresets(next);
+		api.settings.set(PRESETS_KEY, next);
+	};
+	const deletePreset = () => {
+		const name = presetName.trim();
+		const next = userPresets.filter((p) => p.name !== name);
+		setUserPresets(next);
+		api.settings.set(PRESETS_KEY, next);
+		setPresetName("");
+	};
+	const applyPreset = (name) => {
+		const p = [...BUILTIN_PRESETS, ...userPresets].find((x) => x.name === name);
+		if (p) {
+			set({ ...p.opts });
+			setPresetName(name);
+		}
+	};
+	const savedMatch = userPresets.some((p) => p.name === presetName.trim());
+	const run = async () => {
+		setApplying(true);
+		setSummary(null);
+		try {
+			setSummary(await applyRename(plan, (p) => setProg({
+				done: p.done,
+				total: p.total
+			})));
+		} finally {
+			setApplying(false);
+			setProg(null);
+		}
+	};
+	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: "Template" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(TextInput, {
+		value: opts.template,
+		onChange: (v) => set({ template: v }),
+		style: { fontFamily: tokens.fontMono },
+		placeholder: "{name}_{seq}"
+	}), /* @__PURE__ */ React.createElement(Hint, null, "Click to add a token. Anything else is kept as typed."), TOKEN_GROUPS.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.group }, /* @__PURE__ */ React.createElement("div", { style: {
+		color: tokens.textMuted,
+		fontSize: 10,
+		textTransform: "uppercase",
+		letterSpacing: .4,
+		marginBottom: 4
+	} }, g.group), /* @__PURE__ */ React.createElement(Row, {
+		gap: 4,
+		wrap: true
+	}, g.tokens.map((t) => /* @__PURE__ */ React.createElement("button", {
+		key: t.insert,
+		onClick: () => insertToken(t.insert),
+		title: `${t.label} — e.g. ${t.sample}`,
+		style: {
+			font: "inherit",
+			fontSize: 11,
+			fontFamily: tokens.fontMono,
+			padding: "2px 6px",
+			borderRadius: 4,
+			border: `1px solid ${tokens.border}`,
+			background: tokens.surface2,
+			color: tokens.textSecondary,
+			cursor: "pointer"
+		}
+	}, t.insert))))))), /* @__PURE__ */ React.createElement(Section, { title: "Numbering" }, /* @__PURE__ */ React.createElement(Row, {
+		gap: 10,
+		wrap: true
+	}, /* @__PURE__ */ React.createElement(Field, { label: "Start" }, /* @__PURE__ */ React.createElement(NumberInput, {
+		value: opts.seqStart,
+		onChange: (v) => set({ seqStart: Math.trunc(v) }),
+		min: 0,
+		step: 1,
+		width: 64
+	})), /* @__PURE__ */ React.createElement(Field, { label: "Step" }, /* @__PURE__ */ React.createElement(NumberInput, {
+		value: opts.seqStep,
+		onChange: (v) => set({ seqStep: Math.trunc(v) || 1 }),
+		min: 1,
+		step: 1,
+		width: 64
+	})), /* @__PURE__ */ React.createElement(Field, { label: "Digits" }, /* @__PURE__ */ React.createElement(NumberInput, {
+		value: opts.seqPad,
+		onChange: (v) => set({ seqPad: Math.max(1, Math.trunc(v)) }),
+		min: 1,
+		max: 8,
+		step: 1,
+		width: 64
+	})), /* @__PURE__ */ React.createElement(Field, { label: "Case" }, /* @__PURE__ */ React.createElement(SegmentedControl, {
+		value: opts.caseMode,
+		onChange: (v) => set({ caseMode: v }),
+		options: [
+			{
+				value: "asis",
+				label: "Aa"
+			},
+			{
+				value: "lower",
+				label: "aa"
+			},
+			{
+				value: "upper",
+				label: "AA"
+			}
+		]
+	})))), /* @__PURE__ */ React.createElement(Section, { title: "Presets" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Select, {
+		value: "",
+		onChange: applyPreset,
+		placeholder: "Load a preset…",
+		groups: [{
+			title: "Built-in",
+			items: BUILTIN_PRESETS.map((p) => ({
+				value: p.name,
+				label: p.name
+			}))
+		}, ...userPresets.length ? [{
+			title: "Saved",
+			items: userPresets.map((p) => ({
+				value: p.name,
+				label: p.name
+			}))
+		}] : []]
+	}), /* @__PURE__ */ React.createElement(Row, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement(TextInput, {
+		value: presetName,
+		onChange: setPresetName,
+		placeholder: "Save current as…"
+	})), /* @__PURE__ */ React.createElement(Button, {
+		size: "sm",
+		onClick: savePreset,
+		disabled: !presetName.trim()
+	}, savedMatch ? "Update" : "Save"), savedMatch && /* @__PURE__ */ React.createElement(Button, {
+		size: "sm",
+		variant: "danger",
+		onClick: deletePreset
+	}, "Delete")))), /* @__PURE__ */ React.createElement(Section, { title: `Preview (${active.length} to rename)` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Select one or more photos in the grid."), plan.unknownTokens.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, "Unknown token", plan.unknownTokens.length > 1 ? "s" : "", ": ", plan.unknownTokens.map((t) => `{${t}}`).join(", "), " — resolved to nothing."), readingSubsec && /* @__PURE__ */ React.createElement(Hint, null, "Reading subsecond timestamps…"), noSubsecData && /* @__PURE__ */ React.createElement(Hint, null, "None of the selected files carry subsecond EXIF — ", "{subsec}", " resolves to nothing."), plan.duplicates.length > 0 && !readingSubsec && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, "Template produces duplicate names (add ", "{seq}", " or ", "{letter}", "): ", plan.duplicates.slice(0, 3).join(", "), plan.duplicates.length > 3 ? "…" : ""), plan.needsTempPass && active.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "Names overlap the current set — a safe two-pass rename will be used."), active.length > 0 && /* @__PURE__ */ React.createElement("div", { style: {
+		fontFamily: tokens.fontMono,
+		fontSize: 11,
+		lineHeight: 1.7
+	} }, active.slice(0, PREVIEW_LIMIT).map((it) => /* @__PURE__ */ React.createElement("div", {
+		key: it.id,
+		style: {
+			display: "flex",
+			gap: 6,
+			alignItems: "center",
+			whiteSpace: "nowrap",
+			overflow: "hidden"
+		}
+	}, /* @__PURE__ */ React.createElement("span", { style: {
+		color: tokens.textMuted,
+		overflow: "hidden",
+		textOverflow: "ellipsis"
+	} }, it.oldName), /* @__PURE__ */ React.createElement("span", { style: { color: tokens.textMuted } }, "→"), /* @__PURE__ */ React.createElement("span", { style: {
+		color: tokens.textPrimary,
+		overflow: "hidden",
+		textOverflow: "ellipsis"
+	} }, it.newName))), active.length > PREVIEW_LIMIT && /* @__PURE__ */ React.createElement("div", { style: { color: tokens.textMuted } }, "…and ", active.length - PREVIEW_LIMIT, " more")), skipped.length > 0 && /* @__PURE__ */ React.createElement(Hint, null, skipped.length, " skipped: ", skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; "), skipped.length > 3 ? "…" : ""))), prog && /* @__PURE__ */ React.createElement(ProgressBar, { value: prog.total ? prog.done / prog.total : 0 }), summary && /* @__PURE__ */ React.createElement(Notice, { tone: summary.failed.length ? "warn" : "ok" }, "Renamed ", summary.renamed, summary.skipped.length ? `, skipped ${summary.skipped.length}` : "", summary.failed.length ? `, failed ${summary.failed.length}: ${summary.failed.slice(0, 2).map((f) => f.reason).join("; ")}` : "."), /* @__PURE__ */ React.createElement(Button, {
+		variant: "primary",
+		full: true,
+		disabled: !canApply,
+		onClick: run
+	}, applying ? "Renaming…" : `Rename ${active.length || ""} file${active.length === 1 ? "" : "s"}`));
+}
+
+//#endregion
+//#region src/metadata/model.ts
+const pad2 = (n) => n < 10 ? "0" + n : String(n);
+/** Format a Date as EXIF "YYYY:MM:DD HH:MM:SS" in local time. */
+function formatExifDate(d) {
+	return `${d.getFullYear()}:${pad2(d.getMonth() + 1)}:${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+/** Parse EXIF "YYYY:MM:DD HH:MM:SS" to a Date, or null. */
+function parseExifDate(s) {
+	if (!s) return null;
+	const m = s.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+	if (!m) return null;
+	const [, y, mo, d, h, mi, se] = m;
+	const dt = new Date(+y, +mo - 1, +d, +h, +mi, +se);
+	return Number.isNaN(dt.getTime()) ? null : dt;
+}
+/** Resolve the DateOp to a concrete "YYYY:MM:DD HH:MM:SS" for one photo, or
+*  null when there's nothing to write (no-op, or a shift with no base time). */
+function resolveDate(op, photo) {
+	if (op.kind === "none") return null;
+	if (op.kind === "set") return op.value || null;
+	const base = parseExifDate(photo.exif.dateTimeOriginal);
+	if (!base) return null;
+	return formatExifDate(new Date(base.getTime() + op.seconds * 1e3));
+}
+/** Decimal degrees → [deg, min, sec] rationals + hemisphere ref char. */
+function decimalToDms(value, positive, negative) {
+	const ref = value < 0 ? negative : positive;
+	const abs = Math.abs(value);
+	const deg = Math.floor(abs);
+	const minFloat = (abs - deg) * 60;
+	const min = Math.floor(minFloat);
+	const sec = (minFloat - min) * 60;
+	return {
+		ref,
+		pairs: [
+			[deg, 1],
+			[min, 1],
+			[Math.round(sec * 1e3), 1e3]
+		]
+	};
+}
+/** Current editable values for a photo, for prefill in the single-photo case. */
+function currentMeta(photo) {
+	const e = photo.exif;
+	const meta = {
+		artist: e.artist ?? "",
+		copyright: e.copyright ?? "",
+		description: e.imageDescription ?? "",
+		keywords: photo.keywords ?? []
+	};
+	if (e.gpsLatitude != null) meta.gpsLat = e.gpsLatitude;
+	if (e.gpsLongitude != null) meta.gpsLon = e.gpsLongitude;
+	return meta;
 }
 
 //#endregion
@@ -1521,212 +1828,6 @@ async function readSidecarForImport(ctx) {
 	} catch {
 		return;
 	}
-}
-
-//#endregion
-//#region src/metadata/exif-read.ts
-/** Locate the TIFF header a format's EXIF lives in: byte 0 for TIFF/RAW-TIFF,
-*  or just past "Exif\0\0" in a JPEG APP1. Returns -1 when there's no EXIF. */
-function findExifBase(buf) {
-	if (buf.length < 4) return -1;
-	const head = buf[0] << 8 | buf[1];
-	if (head === 18761 || head === 19789) return 0;
-	if (head !== 65496) return -1;
-	let off = 2;
-	while (off + 4 <= buf.length) {
-		if (buf[off] !== 255) break;
-		const marker = buf[off + 1];
-		if (marker === 218 || marker === 217) break;
-		const len = buf[off + 2] << 8 | buf[off + 3];
-		if (marker === 225 && off + 10 <= buf.length) {
-			const sig = off + 4;
-			if (buf[sig] === 69 && buf[sig + 1] === 120 && buf[sig + 2] === 105 && buf[sig + 3] === 102 && buf[sig + 4] === 0 && buf[sig + 5] === 0) return sig + 6;
-		}
-		off += 2 + len;
-	}
-	return -1;
-}
-const TYPE_NAME = {
-	1: "BYTE",
-	2: "ASCII",
-	3: "SHORT",
-	4: "LONG",
-	5: "RATIONAL",
-	6: "SBYTE",
-	7: "UNDEFINED",
-	8: "SSHORT",
-	9: "SLONG",
-	10: "SRATIONAL",
-	11: "FLOAT",
-	12: "DOUBLE"
-};
-const BASE_TAGS = {
-	256: "ImageWidth",
-	257: "ImageLength",
-	258: "BitsPerSample",
-	259: "Compression",
-	262: "PhotometricInterpretation",
-	270: "ImageDescription",
-	271: "Make",
-	272: "Model",
-	273: "StripOffsets",
-	274: "Orientation",
-	277: "SamplesPerPixel",
-	278: "RowsPerStrip",
-	279: "StripByteCounts",
-	282: "XResolution",
-	283: "YResolution",
-	296: "ResolutionUnit",
-	305: "Software",
-	306: "DateTime",
-	315: "Artist",
-	318: "WhitePoint",
-	319: "PrimaryChromaticities",
-	513: "ThumbnailOffset",
-	514: "ThumbnailLength",
-	529: "YCbCrCoefficients",
-	531: "YCbCrPositioning",
-	532: "ReferenceBlackWhite",
-	33432: "Copyright",
-	34665: "ExifIFD",
-	34853: "GPSIFD",
-	40965: "InteropIFD",
-	50341: "PrintIM"
-};
-const EXIF_TAGS = {
-	33434: "ExposureTime",
-	33437: "FNumber",
-	34850: "ExposureProgram",
-	34855: "ISO",
-	34864: "SensitivityType",
-	34866: "RecommendedExposureIndex",
-	36864: "ExifVersion",
-	36867: "DateTimeOriginal",
-	36868: "DateTimeDigitized",
-	36880: "OffsetTime",
-	36881: "OffsetTimeOriginal",
-	37121: "ComponentsConfiguration",
-	37377: "ShutterSpeedValue",
-	37378: "ApertureValue",
-	37380: "ExposureBias",
-	37381: "MaxApertureValue",
-	37382: "SubjectDistance",
-	37383: "MeteringMode",
-	37384: "LightSource",
-	37385: "Flash",
-	37386: "FocalLength",
-	37500: "MakerNote",
-	37510: "UserComment",
-	40960: "FlashpixVersion",
-	40961: "ColorSpace",
-	40962: "PixelXDimension",
-	40963: "PixelYDimension",
-	40965: "InteropIFD",
-	41986: "ExposureMode",
-	41987: "WhiteBalance",
-	41988: "DigitalZoomRatio",
-	41989: "FocalLengthIn35mm",
-	41990: "SceneCaptureType",
-	41992: "Contrast",
-	41993: "Saturation",
-	41994: "Sharpness",
-	42016: "ImageUniqueID",
-	42033: "BodySerialNumber",
-	42034: "LensInfo",
-	42035: "LensMake",
-	42036: "LensModel",
-	42037: "LensSerialNumber"
-};
-const GPS_TAGS = {
-	0: "GPSVersionID",
-	1: "GPSLatitudeRef",
-	2: "GPSLatitude",
-	3: "GPSLongitudeRef",
-	4: "GPSLongitude",
-	5: "GPSAltitudeRef",
-	6: "GPSAltitude",
-	7: "GPSTimeStamp",
-	18: "GPSMapDatum",
-	29: "GPSDateStamp"
-};
-const INTEROP_TAGS = {
-	1: "InteroperabilityIndex",
-	2: "InteroperabilityVersion"
-};
-function nameFor(ifd, tag) {
-	return (ifd === "Exif" ? EXIF_TAGS : ifd === "GPS" ? GPS_TAGS : ifd === "Interop" ? INTEROP_TAGS : BASE_TAGS)[tag] ?? `Tag 0x${tag.toString(16).padStart(4, "0")}`;
-}
-function formatValue(t, little) {
-	const b = t.bytes;
-	if (!b) return t.tag === 273 || t.tag === 513 ? "(image data)" : "";
-	const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-	const cap = 16;
-	switch (t.type) {
-		case 2: {
-			let end = b.length;
-			while (end > 0 && b[end - 1] === 0) end--;
-			return new TextDecoder("utf-8").decode(b.subarray(0, end)).trim();
-		}
-		case 1:
-		case 7: {
-			const n = Math.min(t.count, 64);
-			return Array.from(b.subarray(0, n), (x) => x.toString(16).padStart(2, "0")).join(" ") + (t.count > n ? " …" : "");
-		}
-		case 3:
-		case 8: {
-			const n = Math.min(t.count, cap);
-			const out = [];
-			for (let i = 0; i < n; i++) out.push(t.type === 8 ? dv.getInt16(i * 2, little) : dv.getUint16(i * 2, little));
-			return out.join(", ") + (t.count > n ? " …" : "");
-		}
-		case 4:
-		case 9: {
-			const n = Math.min(t.count, cap);
-			const out = [];
-			for (let i = 0; i < n; i++) out.push(t.type === 9 ? dv.getInt32(i * 4, little) : dv.getUint32(i * 4, little));
-			return out.join(", ") + (t.count > n ? " …" : "");
-		}
-		case 5:
-		case 10: {
-			const n = Math.min(t.count, cap);
-			const out = [];
-			for (let i = 0; i < n; i++) {
-				const num = t.type === 10 ? dv.getInt32(i * 8, little) : dv.getUint32(i * 8, little);
-				const den = t.type === 10 ? dv.getInt32(i * 8 + 4, little) : dv.getUint32(i * 8 + 4, little);
-				out.push(den === 0 ? `${num}/0` : Number.isInteger(num / den) ? `${num / den}` : `${num}/${den}`);
-			}
-			return out.join(", ") + (t.count > n ? " …" : "");
-		}
-		default: return `(${TYPE_NAME[t.type] ?? t.type} ×${t.count})`;
-	}
-}
-function dumpIfd(node, ifd, little, out) {
-	if (!node) return;
-	const rows = node.tags.map((t) => ({
-		tag: t.tag,
-		name: nameFor(ifd, t.tag),
-		value: formatValue(t, little)
-	})).sort((a, b) => a.tag - b.tag);
-	for (const r of rows) out.push({
-		ifd,
-		tag: r.tag,
-		name: r.name,
-		value: r.value
-	});
-}
-/** Decode every kept tag from `buf` into a grouped, human-readable list. */
-function readAllTags(buf) {
-	const base = findExifBase(buf);
-	if (base < 0) return [];
-	const tiff = parseTiff(buf, base);
-	if (!tiff) return [];
-	const out = [];
-	dumpIfd(tiff.ifd0, "IFD0", tiff.little, out);
-	dumpIfd(tiff.ifd0.exif, "Exif", tiff.little, out);
-	dumpIfd(tiff.ifd0.gps, "GPS", tiff.little, out);
-	dumpIfd(tiff.ifd0.interop, "Interop", tiff.little, out);
-	dumpIfd(tiff.ifd0.next, "IFD1", tiff.little, out);
-	return out;
 }
 
 //#endregion

@@ -67,6 +67,7 @@ const EXIF_TAGS: Record<number, string> = {
   0x8827: "ISO", 0x8830: "SensitivityType", 0x8832: "RecommendedExposureIndex",
   0x9000: "ExifVersion", 0x9003: "DateTimeOriginal", 0x9004: "DateTimeDigitized",
   0x9010: "OffsetTime", 0x9011: "OffsetTimeOriginal", 0x9101: "ComponentsConfiguration",
+  0x9290: "SubSecTime", 0x9291: "SubSecTimeOriginal", 0x9292: "SubSecTimeDigitized",
   0x9201: "ShutterSpeedValue", 0x9202: "ApertureValue", 0x9204: "ExposureBias",
   0x9205: "MaxApertureValue", 0x9206: "SubjectDistance", 0x9207: "MeteringMode",
   0x9208: "LightSource", 0x9209: "Flash", 0x920a: "FocalLength",

@@ -23,12 +23,19 @@ two-pass rename so nothing collides.
 | `{folder}` | Containing folder | `Trip` |
 | `{yyyy}` `{yy}` `{mon}` `{day}` | Capture date parts | `2026` `26` `06` `30` |
 | `{hour}` `{min}` `{sec}` | Capture time parts | `14` `05` `42` |
+| `{subsec}` / `{subsec:2}` | Subseconds from EXIF, as milliseconds (or an inline digit count) | `541` / `54` |
 | `{date}` `{time}` | `yyyymmdd` / `hhmmss` | `20260630` `140542` |
 | `{make}` `{model}` `{lens}` | Camera & lens | `NIKON` `Z8` |
 | `{iso}` `{fnum}` `{shutter}` `{focal}` | Exposure | `400` `f2.8` `1_250` `35mm` |
 
 Sequence **start**, **step**, zero-pad **digits**, and a **case** transform are
 set in the panel, and named **presets** can be saved.
+
+`{subsec}` reads `SubSecTimeOriginal` from each file's own EXIF (first match of
+Original / Digitized / plain `SubSecTime`), so a same-second burst renames to
+unique timestamps — e.g. `20260715_120841.541.NEF`, `…841.555.NEF`,
+`…841.577.NEF` from the built-in *Timestamp + subseconds* preset. Files without
+subsecond EXIF resolve it to nothing (the panel says so before you apply).
 
 ## Metadata
 

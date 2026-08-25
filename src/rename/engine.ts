@@ -59,6 +59,7 @@ export const TOKEN_GROUPS: { group: string; tokens: TokenInfo[] }[] = [
       { insert: "{hour}", label: "Hour (24h)", sample: "14" },
       { insert: "{min}", label: "Minute", sample: "05" },
       { insert: "{sec}", label: "Second", sample: "42" },
+      { insert: "{subsec}", label: "Subseconds (ms)", sample: "541" },
       { insert: "{date}", label: "Date (yyyymmdd)", sample: "20260630" },
       { insert: "{time}", label: "Time (hhmmss)", sample: "140542" },
     ],
@@ -80,7 +81,7 @@ export const TOKEN_GROUPS: { group: string; tokens: TokenInfo[] }[] = [
 /** Every recognised bare token id (without args), for validation. */
 const KNOWN_TOKENS = new Set<string>([
   "name", "seq", "letter", "folder", "ext",
-  "yyyy", "yy", "mon", "day", "hour", "min", "sec", "date", "time",
+  "yyyy", "yy", "mon", "day", "hour", "min", "sec", "subsec", "date", "time",
   "make", "model", "lens", "iso", "fnum", "shutter", "focal",
 ]);
 
@@ -145,6 +146,8 @@ interface Ctx {
   photo: CatalogPhoto;
   index: number;
   opts: RenameOptions;
+  /** EXIF subsecond digit strings by photo id (see rename/subsec.ts). */
+  subsec?: ReadonlyMap<string, string>;
 }
 
 /** Resolve one token (already split into name + optional arg). Returns the raw
@@ -187,6 +190,14 @@ function resolveToken(name: string, arg: string | undefined, ctx: Ctx): string |
       return date ? two(date.getMinutes()) : "";
     case "sec":
       return date ? two(date.getSeconds()) : "";
+    case "subsec": {
+      // EXIF SubSecTime* is the decimal fraction as a digit string ("5" = .5s),
+      // so a fixed width needs right-padding, not left: default 3 = milliseconds.
+      const digits = (ctx.subsec?.get(photo.id) ?? "").replace(/\D/g, "");
+      if (!digits) return "";
+      const width = arg && /^\d+$/.test(arg) ? Math.max(1, +arg) : 3;
+      return digits.slice(0, width).padEnd(width, "0");
+    }
     case "date":
       return date
         ? `${date.getFullYear()}${two(date.getMonth() + 1)}${two(date.getDate())}`
@@ -220,8 +231,13 @@ const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
  *  `letter`/`LETTER` are case-sensitive; all other token names are matched
  *  case-insensitively. Unknown tokens resolve to "" (and are surfaced by
  *  collectUnknownTokens for a warning). */
-export function renderTemplate(photo: CatalogPhoto, index: number, opts: RenameOptions): string {
-  const ctx: Ctx = { photo, index, opts };
+export function renderTemplate(
+  photo: CatalogPhoto,
+  index: number,
+  opts: RenameOptions,
+  subsecById?: ReadonlyMap<string, string>,
+): string {
+  const ctx: Ctx = { photo, index, opts, subsec: subsecById };
   const out = opts.template.replace(TOKEN_RE, (_all, rawName: string, arg?: string) => {
     const name = rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase();
     const val = resolveToken(name, arg, ctx);
@@ -235,6 +251,15 @@ export function renderTemplate(photo: CatalogPhoto, index: number, opts: RenameO
   if (opts.caseMode === "lower") base = base.toLowerCase();
   else if (opts.caseMode === "upper") base = base.toUpperCase();
   return base;
+}
+
+/** Whether the template resolves {subsec} — the tab only harvests EXIF
+ *  subseconds from files when it does. */
+export function templateUsesSubsec(template: string): boolean {
+  for (const m of template.matchAll(TOKEN_RE)) {
+    if (m[1].toLowerCase() === "subsec") return true;
+  }
+  return false;
 }
 
 /** Token ids present in the template that aren't recognised — for a live
@@ -275,10 +300,14 @@ export interface RenamePlan {
  *  in-batch duplicate names and whether a temp pass is required to dodge
  *  target↔target name swaps. Virtual copies are marked skipped — they share the
  *  master's file, so core refuses to rename them. */
-export function planRename(targets: CatalogPhoto[], opts: RenameOptions): RenamePlan {
+export function planRename(
+  targets: CatalogPhoto[],
+  opts: RenameOptions,
+  subsecById?: ReadonlyMap<string, string>,
+): RenamePlan {
   const items: PlanItem[] = targets.map((photo, i) => {
     const ext = splitExt(photo.filename).ext;
-    const newBase = renderTemplate(photo, i, opts);
+    const newBase = renderTemplate(photo, i, opts, subsecById);
     const newName = ext ? `${newBase}.${ext}` : newBase;
     const item: PlanItem = {
       id: photo.id,
