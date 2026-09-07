@@ -53,7 +53,12 @@ thumbnail tag, not just the handful the Info panel shows).
 - **RAW and everything else** → a non-destructive **`.xmp` sidecar** next to the
   file (read back by this extension so Safelight still shows the values). If an
   in-place edit can't be done safely it falls back to a sidecar automatically
-  rather than risking the original.
+  rather than risking the original. Sidecars use the Adobe naming convention
+  shared with the XMP Tools extension (`DSC01234.ARW` → `DSC01234.xmp`), and
+  edits merge into an existing sidecar without touching properties written by
+  other tools. Sidecars this extension wrote under its old `DSC01234.ARW.xmp`
+  naming migrate automatically on the next edit; foreign sidecars using that
+  naming (darktable's, for example) are read but never deleted.
 
 Keywords are stored in the catalog for every format (and in the sidecar for
 RAW); the other fields are written into the file's EXIF for JPEG/TIFF.

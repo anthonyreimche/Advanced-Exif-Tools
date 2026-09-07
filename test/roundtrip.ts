@@ -6,7 +6,8 @@ import {
   parseTiff, serializeTiff, setAscii, getAscii, ensureExif, type Tiff,
 } from "../src/metadata/tiff";
 import { getExifTiff, writeExifIntoJpeg } from "../src/metadata/jpeg";
-import { upsertXmp, readXmp } from "../src/metadata/xmp";
+import { upsertXmp, readXmp, sidecarName, legacySidecarName, isOwnPacket } from "../src/metadata/xmp";
+import { writeSidecar, readSidecarForImport } from "../src/metadata/apply";
 import { readAllTags } from "../src/metadata/exif-read";
 import {
   planRename, renderTemplate, collectUnknownTokens, templateUsesSubsec,
@@ -116,6 +117,159 @@ function testXmp(): void {
   ok("updates creator", readXmp(updated).meta.artist === "Kim");
   ok("preserves foreign prop", updated.includes("foo:bar"));
   ok("no duplicate creator", (updated.match(/<dc:creator>/g) ?? []).length === 1);
+
+  // GPS round-trips through the packet (regression: it used to be write-only,
+  // so a rescan silently dropped coordinates from the catalog).
+  const withGps = upsertXmp(null, { meta: { gpsLat: 49.5, gpsLon: -123.25 } });
+  const gps = readXmp(withGps).meta;
+  ok("gps latitude round-trips", Math.abs((gps.gpsLat ?? NaN) - 49.5) < 1e-4);
+  ok("gps longitude round-trips", Math.abs((gps.gpsLon ?? NaN) - -123.25) < 1e-4);
+
+  // Foreign writers use the comma-DMS form; both variants must parse.
+  const dms = readXmp(
+    `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="r"><rdf:Description rdf:about=""
+      xmlns:exif="http://ns.adobe.com/exif/1.0/">
+      <exif:GPSLatitude>37,48,30N</exif:GPSLatitude>
+      <exif:GPSLongitude>122,16.5000W</exif:GPSLongitude>
+    </rdf:Description></rdf:RDF></x:xmpmeta>`,
+  ).meta;
+  ok("parses DD,MM,SS form", Math.abs((dms.gpsLat ?? NaN) - (37 + 48 / 60 + 30 / 3600)) < 1e-6);
+  ok("parses DD,MM.mmmm form", Math.abs((dms.gpsLon ?? NaN) - -(122 + 16.5 / 60)) < 1e-6);
+
+  ok("fresh packets carry our marker", isOwnPacket(first));
+  ok("foreign packets are not ours", !isOwnPacket(`<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="darktable 4.6"></x:xmpmeta>`));
+
+  // darktable/exiv2 write attribute-only, self-closed Descriptions; upserting
+  // into one must still land our elements and keep the foreign attributes.
+  const dtPacket = `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/" darktable:history_end="7"/>
+ </rdf:RDF>
+</x:xmpmeta>`;
+  const dtUpserted = upsertXmp(dtPacket, { meta: { artist: "Kim" } });
+  ok("self-closed Description gains our field", readXmp(dtUpserted).meta.artist === "Kim");
+  ok("foreign attribute survives", dtUpserted.includes('darktable:history_end="7"'));
+
+  // "$&"-style user text must not trip String.replace's $-pattern expansion.
+  const dollar = upsertXmp(first, { meta: { keywords: ["fish$&chips"] } });
+  ok("dollar keyword inserted verbatim", dollar.includes("fish$&amp;chips"));
+  ok("packet still well-terminated", (dollar.match(/<\/rdf:Description>/g) ?? []).length === 1);
+}
+
+const OWN_LEGACY = upsertXmp(null, { meta: { artist: "Old Artist", description: "Keep me" } });
+const DT_LEGACY = `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/" darktable:history_end="7"/>
+ </rdf:RDF>
+</x:xmpmeta>`;
+
+function fakeDir(initial: Record<string, string> = {}) {
+  const files = new Map<string, string>(Object.entries(initial));
+  const dir = {
+    files,
+    async getFileHandle(name: string, opts?: { create?: boolean }) {
+      if (!files.has(name)) {
+        if (!opts?.create) throw new Error("NotFound");
+        files.set(name, "");
+      }
+      return {
+        name,
+        async getFile() {
+          return { text: async () => files.get(name)! };
+        },
+        async createWritable() {
+          let buf = "";
+          return {
+            async write(data: unknown) {
+              buf +=
+                typeof data === "string" ? data : new TextDecoder().decode(data as Uint8Array);
+            },
+            async close() {
+              files.set(name, buf);
+            },
+          };
+        },
+      };
+    },
+    async removeEntry(name: string) {
+      if (!files.has(name)) throw new Error("NotFound");
+      files.delete(name);
+    },
+  };
+  return dir as unknown as FileSystemDirectoryHandle & { files: Map<string, string> };
+}
+
+async function testSidecarWrite(): Promise<void> {
+  console.log("Sidecar write / migration:");
+
+  // Fresh RAW edit lands on the Adobe name, not the legacy one.
+  const fresh = fakeDir();
+  await writeSidecar(fakePhoto({ filename: "DSC01234.ARW", directoryHandle: fresh }), { copyright: "C" }, null);
+  ok("writes the Adobe name", fresh.files.has("DSC01234.xmp"));
+  ok("does not write the legacy name", !fresh.files.has("DSC01234.ARW.xmp"));
+
+  // A legacy sidecar of ours seeds the new file and is then removed.
+  const ours = fakeDir({ "DSC01234.ARW.xmp": OWN_LEGACY });
+  await writeSidecar(fakePhoto({ filename: "DSC01234.ARW", directoryHandle: ours }), { copyright: "New C" }, null);
+  const migrated = readXmp(ours.files.get("DSC01234.xmp") ?? "");
+  ok("seeds earlier edits from legacy", migrated.meta.artist === "Old Artist");
+  ok("applies the new edit", migrated.meta.copyright === "New C");
+  ok("deletes our legacy sidecar", !ours.files.has("DSC01234.ARW.xmp"));
+
+  // A foreign legacy sidecar (darktable) seeds but is never deleted.
+  const foreign = fakeDir({ "DSC01234.ARW.xmp": DT_LEGACY });
+  await writeSidecar(fakePhoto({ filename: "DSC01234.ARW", directoryHandle: foreign }), { artist: "Kim" }, null);
+  ok("foreign legacy is kept", foreign.files.has("DSC01234.ARW.xmp"));
+  ok("new sidecar carries the edit", readXmp(foreign.files.get("DSC01234.xmp") ?? "").meta.artist === "Kim");
+  ok("foreign content carried into the new sidecar", (foreign.files.get("DSC01234.xmp") ?? "").includes("darktable:history_end"));
+
+  // With both present, the Adobe-name file is the source of truth.
+  const both = fakeDir({
+    "DSC01234.xmp": upsertXmp(null, { meta: { artist: "Current" } }),
+    "DSC01234.ARW.xmp": OWN_LEGACY,
+  });
+  await writeSidecar(fakePhoto({ filename: "DSC01234.ARW", directoryHandle: both }), { copyright: "C2" }, null);
+  const kept = readXmp(both.files.get("DSC01234.xmp") ?? "");
+  ok("existing Adobe-name content wins", kept.meta.artist === "Current");
+  ok("stale our-legacy cleaned up", !both.files.has("DSC01234.ARW.xmp"));
+
+  // Extension-less files: legacy and new names coincide; nothing is deleted.
+  const bare = fakeDir();
+  await writeSidecar(fakePhoto({ filename: "noext", directoryHandle: bare }), { artist: "A" }, null);
+  ok("single sidecar for extension-less file", bare.files.has("noext.xmp"));
+
+  // Import folds the Adobe-name sidecar back on, GPS included.
+  const importDir = fakeDir({
+    "DSC01234.xmp": upsertXmp(null, { meta: { artist: "Jo", gpsLat: 49.5, gpsLon: -123.25 } }),
+  });
+  const patch = await readSidecarForImport({
+    photo: fakePhoto({ filename: "DSC01234.ARW" }),
+    dir: importDir,
+    fileName: "DSC01234.ARW",
+  });
+  ok("import reads the Adobe name", patch?.exif?.artist === "Jo");
+  ok("import folds GPS latitude", Math.abs((patch?.exif?.gpsLatitude ?? NaN) - 49.5) < 1e-4);
+  ok("import folds GPS longitude", Math.abs((patch?.exif?.gpsLongitude ?? NaN) - -123.25) < 1e-4);
+
+  // Import still reads a legacy-only sidecar (pre-migration folders).
+  const legacyDir = fakeDir({ "DSC01234.ARW.xmp": OWN_LEGACY });
+  const legacyPatch = await readSidecarForImport({
+    photo: fakePhoto({ filename: "DSC01234.ARW" }),
+    dir: legacyDir,
+    fileName: "DSC01234.ARW",
+  });
+  ok("import falls back to the legacy name", legacyPatch?.exif?.artist === "Old Artist");
+}
+
+function testSidecarNaming(): void {
+  console.log("Sidecar naming (Adobe convention, shared with XMP Tools):");
+  ok("RAW strips the extension", sidecarName("DSC01234.ARW") === "DSC01234.xmp");
+  ok("lowercase RAW too", sidecarName("img_0042.cr3") === "img_0042.xmp");
+  ok("non-RAW keeps a suffix", sidecarName("IMG.JPG") === "IMG_jpg.xmp");
+  ok("png keeps a suffix", sidecarName("photo.png") === "photo_png.xmp");
+  ok("no extension appends .xmp", sidecarName("noext") === "noext.xmp");
+  ok("legacy name is filename + .xmp", legacySidecarName("DSC01234.ARW") === "DSC01234.ARW.xmp");
+  ok("legacy equals new when extension-less", legacySidecarName("noext") === sidecarName("noext"));
 }
 
 function fakePhoto(over: Partial<CatalogPhoto>): CatalogPhoto {
@@ -219,7 +373,9 @@ console.log("\nAdvanced EXIF Tools — verification\n");
 testTiffRoundtrip();
 testJpeg();
 testXmp();
+testSidecarNaming();
 testRename();
 testSubsec();
+await testSidecarWrite();
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) throw new Error(`${failed} checks failed`);

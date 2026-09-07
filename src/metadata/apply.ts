@@ -12,7 +12,7 @@ import {
   type Tiff, type IfdNode,
 } from "./tiff";
 import { getExifTiff, writeExifIntoJpeg } from "./jpeg";
-import { upsertXmp, readXmp } from "./xmp";
+import { upsertXmp, readXmp, sidecarName, legacySidecarName, isOwnPacket } from "./xmp";
 
 const IFD0_DESC = 0x010e;
 const IFD0_ARTIST = 0x013b;
@@ -142,20 +142,40 @@ async function writeBytes(handle: FileSystemFileHandle, data: Uint8Array): Promi
   await w.close();
 }
 
-async function writeSidecar(photo: CatalogPhoto, edits: EditableMeta, dateStr: string | null): Promise<void> {
-  const dir = photo.directoryHandle;
-  if (!dir) throw new Error("No folder handle for this photo.");
-  const name = `${photo.filename}.xmp`;
-  let existing: string | null = null;
+async function sidecarText(dir: FileSystemDirectoryHandle, name: string): Promise<string | null> {
   try {
     const fh = await dir.getFileHandle(name);
-    existing = await (await fh.getFile()).text();
+    return await (await fh.getFile()).text();
   } catch {
-    existing = null; // no sidecar yet
+    return null; // no sidecar
   }
-  const text = upsertXmp(existing, { meta: edits, date: dateStr ?? undefined });
+}
+
+/** Write the sidecar under the Adobe naming shared with the XMP Tools
+ *  extension (DSC.ARW → DSC.xmp), seeding from — and migrating away — the
+ *  pre-1.2 `<filename>.xmp` name. The legacy file is deleted only when its
+ *  packet is provably ours: darktable uses the same legacy naming, and its
+ *  sidecars are not ours to remove. Exported for the node test harness. */
+export async function writeSidecar(photo: CatalogPhoto, edits: EditableMeta, dateStr: string | null): Promise<void> {
+  const dir = photo.directoryHandle;
+  if (!dir) throw new Error("No folder handle for this photo.");
+  const name = sidecarName(photo.filename);
+  const legacyName = legacySidecarName(photo.filename);
+
+  const existing = await sidecarText(dir, name);
+  const legacy = name === legacyName ? null : await sidecarText(dir, legacyName);
+
+  const text = upsertXmp(existing ?? legacy, { meta: edits, date: dateStr ?? undefined });
   const fh = await dir.getFileHandle(name, { create: true });
   await writeBytes(fh, new TextEncoder().encode(text));
+
+  if (legacy !== null && isOwnPacket(legacy)) {
+    try {
+      await dir.removeEntry(legacyName);
+    } catch {
+      // Losing the cleanup is harmless; the new sidecar is already in place.
+    }
+  }
 }
 
 /** Reflect the edits into the catalog record so the grid/info update this
@@ -254,14 +274,20 @@ export async function readSidecarForImport(ctx: {
   fileName: string;
 }): Promise<Partial<CatalogPhoto> | void> {
   try {
-    const fh = await ctx.dir.getFileHandle(`${ctx.fileName}.xmp`);
-    const text = await (await fh.getFile()).text();
+    const text =
+      (await sidecarText(ctx.dir, sidecarName(ctx.fileName))) ??
+      (await sidecarText(ctx.dir, legacySidecarName(ctx.fileName)));
+    if (text === null) return; // no sidecar — nothing to merge
     const data = readXmp(text);
     const exif = { ...ctx.photo.exif };
     if (data.meta.artist) exif.artist = data.meta.artist;
     if (data.meta.copyright) exif.copyright = data.meta.copyright;
     if (data.meta.description) exif.imageDescription = data.meta.description;
     if (data.date) exif.dateTimeOriginal = data.date;
+    if (data.meta.gpsLat !== undefined && data.meta.gpsLon !== undefined) {
+      exif.gpsLatitude = data.meta.gpsLat;
+      exif.gpsLongitude = data.meta.gpsLon;
+    }
     const patch: Partial<CatalogPhoto> = { exif };
     if (data.meta.keywords?.length) {
       const merged = new Set([...(ctx.photo.keywords ?? []), ...data.meta.keywords]);
@@ -269,6 +295,6 @@ export async function readSidecarForImport(ctx: {
     }
     return patch;
   } catch {
-    return; // no sidecar / unreadable — nothing to merge
+    return; // unreadable sidecar — nothing to merge
   }
 }

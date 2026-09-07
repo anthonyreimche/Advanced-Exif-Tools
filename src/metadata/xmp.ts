@@ -12,6 +12,35 @@ const NS = {
   xmp: "http://ns.adobe.com/xap/1.0/",
 };
 
+const XMPTK = "Advanced EXIF Tools";
+
+// ── sidecar naming ───────────────────────────────────────────────────────────
+
+// Must match the XMP Tools extension's list so both resolve the same file.
+const RAW_EXT = /^(nef|cr2|cr3|crw|dng|arw|orf|raf|rw2|pef|srw|3fr|dcr|erf|kdc|mos|raw|nrw)$/i;
+
+/** Adobe/Lightroom sidecar convention, shared with the XMP Tools extension:
+ *  DSC.ARW → DSC.xmp; IMG.JPG → IMG_jpg.xmp; extension-less → name.xmp. */
+export function sidecarName(imageFilename: string): string {
+  const dot = imageFilename.lastIndexOf(".");
+  if (dot === -1) return `${imageFilename}.xmp`;
+  const base = imageFilename.slice(0, dot);
+  const ext = imageFilename.slice(dot + 1).toLowerCase();
+  return RAW_EXT.test(ext) ? `${base}.xmp` : `${base}_${ext}.xmp`;
+}
+
+/** The pre-1.2 name (full filename + ".xmp"), still read for migration. */
+export function legacySidecarName(imageFilename: string): string {
+  return `${imageFilename}.xmp`;
+}
+
+/** True only for packets this extension created from scratch. darktable uses
+ *  the same legacy naming for its sidecars, so migration may delete a legacy
+ *  file only when this marker proves it is ours. */
+export function isOwnPacket(text: string): boolean {
+  return text.includes(`x:xmptk="${XMPTK}"`);
+}
+
 function esc(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -103,7 +132,7 @@ function managedElements(fields: PacketFields): { tag: string; xml: string | nul
 function freshPacket(inner: string): string {
   return (
     `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n` +
-    `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Advanced EXIF Tools">\n` +
+    `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="${XMPTK}">\n` +
     ` <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n` +
     `  <rdf:Description rdf:about=""\n` +
     `    xmlns:dc="${NS.dc}"\n    xmlns:exif="${NS.exif}"\n    xmlns:xmp="${NS.xmp}">\n` +
@@ -126,6 +155,9 @@ export function upsertXmp(existing: string | null, fields: PacketFields): string
   }
 
   let text = existing;
+  // darktable/exiv2 write attribute-only Descriptions self-closed; expand so
+  // the element insertion below has a closing tag to land in.
+  text = text.replace(/<rdf:Description\b([^>]*?)\/\s*>/, "<rdf:Description$1></rdf:Description>");
   // Remove any prior copies of the properties we manage (element form; these
   // fields aren't used in attribute form by mainstream writers).
   for (const m of managed) {
@@ -144,9 +176,10 @@ export function upsertXmp(existing: string | null, fields: PacketFields): string
     return `<rdf:Description${a}>`;
   });
 
-  // Insert our fresh elements just before the closing Description tag.
+  // Insert our fresh elements just before the closing Description tag. The
+  // function form keeps "$&"-style user text out of $-pattern expansion.
   const insertion = additions.length ? `   ${additions.join("\n   ")}\n  ` : "";
-  return text.replace(/<\/rdf:Description>/, `${insertion}</rdf:Description>`);
+  return text.replace(/<\/rdf:Description>/, () => `${insertion}</rdf:Description>`);
 }
 
 // ── reading ──────────────────────────────────────────────────────────────────
@@ -180,6 +213,14 @@ export interface SidecarData {
   date?: string;
 }
 
+/** XMP "DDD,MM.mmmmH" or "DDD,MM,SSH" GPS coordinate → signed decimal degrees. */
+function xmpGpsToDecimal(value: string): number | undefined {
+  const m = value.trim().match(/^(\d+),(\d+(?:\.\d+)?)(?:,(\d+(?:\.\d+)?))?\s*([NSEW])$/i);
+  if (!m) return undefined;
+  const deg = Number(m[1]) + Number(m[2]) / 60 + (m[3] ? Number(m[3]) / 3600 : 0);
+  return /^[SW]$/i.test(m[4]) ? -deg : deg;
+}
+
 /** Parse the fields we manage out of an XMP sidecar's text. */
 export function readXmp(text: string): SidecarData {
   const meta: EditableMeta = {};
@@ -191,6 +232,19 @@ export function readXmp(text: string): SidecarData {
   if (desc) meta.description = desc;
   const kws = bagItems(text, "dc:subject");
   if (kws.length) meta.keywords = kws;
+
+  const coord = (tag: string): number | undefined => {
+    const el =
+      new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text) ??
+      new RegExp(`\\s${tag}="([^"]*)"`).exec(text);
+    return el ? xmpGpsToDecimal(unesc(el[1])) : undefined;
+  };
+  const lat = coord("exif:GPSLatitude");
+  const lon = coord("exif:GPSLongitude");
+  if (lat !== undefined && lon !== undefined) {
+    meta.gpsLat = lat;
+    meta.gpsLon = lon;
+  }
 
   const out: SidecarData = { meta };
   const iso = /<exif:DateTimeOriginal>([\s\S]*?)<\/exif:DateTimeOriginal>/.exec(text)
