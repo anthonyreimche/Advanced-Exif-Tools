@@ -28,6 +28,9 @@ const TAG_TILE_BYTECOUNTS = 0x0145;
 const TAG_JPEG_THUMB_OFFSET = 0x0201;
 const TAG_JPEG_THUMB_LENGTH = 0x0202;
 
+// Points at further IFDs (multi-page / reduced-resolution images) we don't relocate.
+const TAG_SUB_IFDS = 0x014a;
+
 export interface TiffTag {
   tag: number;
   type: FieldType;
@@ -35,6 +38,8 @@ export interface TiffTag {
   /** Raw value bytes in the file's endianness, length = count * typeSize.
    *  Undefined for the offset tag whose values we recompute at serialize. */
   bytes?: Uint8Array;
+  /** Where the value bytes sat, from the TIFF header, when stored out of line. */
+  at?: number;
 }
 
 export interface IfdNode {
@@ -107,7 +112,10 @@ function readIfd(
 
   for (let i = 0; i < count; i++) {
     const entryOff = ifdOffset + 2 + i * 12;
-    if (r.base + entryOff + 12 > buf.byteLength) break;
+    if (r.base + entryOff + 12 > buf.byteLength) {
+      state.complex = true; // truncated IFD: the missing entries would be dropped
+      break;
+    }
     const tag = r.u16(entryOff);
     const type = r.u16(entryOff + 2);
     const cnt = r.u32(entryOff + 4);
@@ -117,11 +125,13 @@ function readIfd(
     const absData = r.base + dataOff;
 
     if (tag === TAG_EXIF_IFD || tag === TAG_GPS_IFD || tag === TAG_INTEROP_IFD) {
-      const sub = readIfd(buf, r, r.u32(valueFieldOff), depth + 1, state);
+      const pointer = r.u32(valueFieldOff);
+      const sub = readIfd(buf, r, pointer, depth + 1, state);
+      if (!sub && pointer !== 0) state.complex = true; // a sub-IFD we'd silently lose
       if (sub) {
-        if (tag === TAG_EXIF_IFD) node.exif = sub;
-        else if (tag === TAG_GPS_IFD) node.gps = sub;
-        else node.interop = sub;
+        const slot = tag === TAG_EXIF_IFD ? "exif" : tag === TAG_GPS_IFD ? "gps" : "interop";
+        if (node[slot]) state.complex = true; // a repeated pointer would orphan the first sub-IFD
+        node[slot] = sub;
       }
       continue; // pointer rebuilt on serialize; don't keep as a normal tag
     }
@@ -132,10 +142,13 @@ function readIfd(
       continue;
     }
     const bytes = buf.subarray(absData, absData + size);
-    const t: TiffTag = { tag, type, count: cnt, bytes };
+    const t: TiffTag = { tag, type, count: cnt, bytes, at: size > 4 ? dataOff : undefined };
     node.tags.push(t);
 
+    if (tag === TAG_SUB_IFDS) state.complex = true;
     if (tag === TAG_STRIP_OFFSETS || tag === TAG_TILE_OFFSETS || tag === TAG_JPEG_THUMB_OFFSET) {
+      // Only one offset tag per IFD is relocated; a second would keep stale offsets.
+      if (offsetTag !== undefined) state.complex = true;
       offsetTag = tag;
     } else if (
       tag === TAG_STRIP_BYTECOUNTS ||
@@ -176,7 +189,14 @@ function readIfd(
     }
   }
 
-  node.next = readIfd(buf, r, r.u32(ifdOffset + 2 + count * 12), depth + 1, state) ?? undefined;
+  const nextField = ifdOffset + 2 + count * 12;
+  if (r.base + nextField + 4 > buf.byteLength) {
+    state.complex = true;
+    return node;
+  }
+  const nextOffset = r.u32(nextField);
+  node.next = readIfd(buf, r, nextOffset, depth + 1, state) ?? undefined;
+  if (!node.next && nextOffset !== 0) state.complex = true;
   return node;
 }
 
@@ -293,15 +313,18 @@ interface PlannedEntry {
   pointer?: "exif" | "gps" | "interop";
   /** For the offset tag: emit new block offsets instead of `bytes`. */
   offsetKind?: boolean;
+  /** Value written at this fixed offset instead of into the IFD's data area. */
+  fixedAt?: number;
 }
 
-function plannedEntriesFor(node: IfdNode, little: boolean): PlannedEntry[] {
+function plannedEntriesFor(node: IfdNode, little: boolean, keep: TiffTag | undefined): PlannedEntry[] {
   const entries: PlannedEntry[] = [];
   for (const t of node.tags) {
     if (t.tag === node.offsetTag) {
       entries.push({ tag: t.tag, type: t.type, count: t.count, offsetKind: true });
     } else if (t.bytes) {
-      entries.push({ tag: t.tag, type: t.type, count: t.count, bytes: t.bytes });
+      const fixedAt = t === keep ? t.at : undefined;
+      entries.push({ tag: t.tag, type: t.type, count: t.count, bytes: t.bytes, fixedAt });
     }
   }
   if (node.exif) entries.push({ tag: TAG_EXIF_IFD, type: 4, count: 1, pointer: "exif" });
@@ -313,9 +336,25 @@ function plannedEntriesFor(node: IfdNode, little: boolean): PlannedEntry[] {
   return entries;
 }
 
-/** Re-serialize `tiff` to a standalone TIFF byte buffer. */
-export function serializeTiff(tiff: Tiff): Uint8Array {
+/** Re-serialize `tiff` to a standalone TIFF byte buffer. `keep`, a parsed
+ *  out-of-line tag, has its value written back at its original offset with
+ *  everything else laid out around it: maker notes often address their own data
+ *  by offsets from the TIFF header, which only stay valid if the note stays put. */
+export function serializeTiff(tiff: Tiff, keep?: TiffTag): Uint8Array {
   const little = tiff.little;
+  const reserved =
+    keep?.at !== undefined && keep.bytes ? { start: keep.at, end: keep.at + keep.bytes.length } : null;
+  if (reserved && reserved.start < 8) throw new Error("Kept value overlaps the TIFF header.");
+
+  let cursor = 8; // after TIFF header
+  const alloc = (len: number): number => {
+    if (reserved && len > 0 && cursor < reserved.end && cursor + len > reserved.start) {
+      cursor = align2(reserved.end);
+    }
+    const at = cursor;
+    cursor = align2(at + len);
+    return at;
+  };
 
   // Depth-first order: an IFD, then its exif/gps/interop, then the next IFD.
   const order: IfdNode[] = [];
@@ -330,13 +369,12 @@ export function serializeTiff(tiff: Tiff): Uint8Array {
 
   // Pass 1: assign IFD + overflow-data offsets sequentially after the header.
   const planned: Planned[] = [];
-  let cursor = 8; // after TIFF header
   for (const node of order) {
-    const entries = plannedEntriesFor(node, little);
-    const ifdOffset = cursor;
-    const entriesSize = 2 + entries.length * 12 + 4;
+    const entries = plannedEntriesFor(node, little, keep);
+    const ifdOffset = alloc(2 + entries.length * 12 + 4);
     let dataSize = 0;
     for (const e of entries) {
+      if (e.fixedAt !== undefined) continue;
       const len = e.offsetKind
         ? e.count * 4 // offsets emitted as LONG array
         : e.bytes
@@ -344,24 +382,18 @@ export function serializeTiff(tiff: Tiff): Uint8Array {
           : 0;
       if (len > 4) dataSize += align2(len);
     }
-    const dataOffset = ifdOffset + entriesSize;
+    const dataOffset = alloc(dataSize);
     planned.push({ node, entries, ifdOffset, dataOffset, dataSize });
-    cursor = dataOffset + dataSize;
   }
 
   // Pass 2: assign external block offsets (strips/tiles/thumbnail) after IFDs.
   const blockOffsets = new Map<IfdNode, number[]>();
   for (const node of order) {
     if (!node.blocks) continue;
-    const offs: number[] = [];
-    for (const b of node.blocks) {
-      offs.push(cursor);
-      cursor = align2(cursor + b.length);
-    }
-    blockOffsets.set(node, offs);
+    blockOffsets.set(node, node.blocks.map((b) => alloc(b.length)));
   }
 
-  const total = cursor;
+  const total = Math.max(cursor, reserved?.end ?? 0);
   const out = new Uint8Array(total);
   const dv = new DataView(out.buffer);
   const nodeToPlan = new Map(planned.map((p) => [p.node, p] as const));
@@ -393,7 +425,7 @@ export function serializeTiff(tiff: Tiff): Uint8Array {
         count = 1;
       } else if (e.offsetKind) {
         const offs = blockOffsets.get(p.node) ?? [];
-        type = 4; // normalise to LONG
+        type = 4; // normalize to LONG
         count = offs.length;
         const b = new Uint8Array(offs.length * 4);
         const bd = new DataView(b.buffer);
@@ -408,6 +440,9 @@ export function serializeTiff(tiff: Tiff): Uint8Array {
       if (valueBytes.length <= 4) {
         // Inline, left-justified; remaining bytes stay zero.
         out.set(valueBytes, entryOff + 8);
+      } else if (e.fixedAt !== undefined) {
+        dv.setUint32(entryOff + 8, e.fixedAt, little);
+        out.set(valueBytes, e.fixedAt);
       } else {
         dv.setUint32(entryOff + 8, dataPtr, little);
         out.set(valueBytes, dataPtr);

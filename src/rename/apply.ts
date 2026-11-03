@@ -18,9 +18,9 @@ export interface ApplyOutcome {
   failed: { name: string; reason: string }[];
 }
 
-async function rename(id: string, base: string): Promise<{ ok: boolean; reason?: string }> {
+async function rename(id: string, base: string): Promise<{ ok: boolean; filename?: string; reason?: string }> {
   const r = await api.catalog.renamePhoto(id, base);
-  return r.ok ? { ok: true } : { ok: false, reason: r.reason };
+  return r.ok ? { ok: true, filename: r.filename } : { ok: false, reason: r.reason };
 }
 
 export async function applyRename(
@@ -46,15 +46,17 @@ export async function applyRename(
   const nonce = Date.now().toString(36);
 
   if (plan.needsTempPass) {
-    const staged = new Set<string>();
+    const staged = new Map<string, string>();
     for (let i = 0; i < active.length; i++) {
       const it = active[i];
-      const r = await rename(it.id, `__aet_${nonce}_${i}`);
-      if (r.ok) staged.add(it.id);
+      const tempBase = `__aet_${nonce}_${i}`;
+      const r = await rename(it.id, tempBase);
+      if (r.ok) staged.set(it.id, r.filename ?? tempBase);
       else outcome.failed.push({ name: it.oldName, reason: r.reason ?? "Rename failed." });
     }
     for (const it of active) {
-      if (!staged.has(it.id)) continue;
+      const tempName = staged.get(it.id);
+      if (tempName === undefined) continue;
       report(it.newName);
       const r = await rename(it.id, it.newBase);
       if (r.ok) {
@@ -64,8 +66,12 @@ export async function applyRename(
         // file). Restore the original name so nothing is left stranded at its
         // temporary name.
         const origBase = it.oldName.replace(/\.[^.]+$/, "");
-        await rename(it.id, origBase);
-        outcome.failed.push({ name: it.oldName, reason: r.reason ?? "Rename failed." });
+        const restored = await rename(it.id, origBase);
+        const reason = r.reason ?? "Rename failed.";
+        outcome.failed.push({
+          name: it.oldName,
+          reason: restored.ok ? reason : `${reason} Restoring the name failed too, so it was left as ${tempName}.`,
+        });
       }
       done++;
     }

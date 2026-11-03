@@ -79,6 +79,6 @@ npm run typecheck
 React is left external and taken from `api.react`; the single ESM bundle exports
 `activate(api)`.
 
-## License
+## Licence
 
 MIT © Anthony Reimche

@@ -78,7 +78,7 @@ export const TOKEN_GROUPS: { group: string; tokens: TokenInfo[] }[] = [
   },
 ];
 
-/** Every recognised bare token id (without args), for validation. */
+/** Every recognized bare token id (without args), for validation. */
 const KNOWN_TOKENS = new Set<string>([
   "name", "seq", "letter", "folder", "ext",
   "yyyy", "yy", "mon", "day", "hour", "min", "sec", "subsec", "date", "time",
@@ -262,7 +262,7 @@ export function templateUsesSubsec(template: string): boolean {
   return false;
 }
 
-/** Token ids present in the template that aren't recognised — for a live
+/** Token ids present in the template that aren't recognized — for a live
  *  "unknown token" hint. `letter`/`LETTER` both fold to the known "letter". */
 export function collectUnknownTokens(template: string): string[] {
   const seen = new Set<string>();

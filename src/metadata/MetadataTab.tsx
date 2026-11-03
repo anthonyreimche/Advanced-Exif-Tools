@@ -166,7 +166,7 @@ export function MetadataTab(): React.ReactElement {
           <Field label="Caption / description">
             <TextArea value={description} onChange={(v) => { setDescription(v); mark("description"); }} rows={2} placeholder={single ? "" : "(leave unchanged)"} />
           </Field>
-          <Field label="Keywords" hint="Comma-separated">
+          <Field label="Keywords" hint="Comma-separated. Kept in the catalog and .xmp sidecars, not written into JPEG or TIFF files.">
             <TextArea value={keywords} onChange={(v) => { setKeywords(v); mark("keywords"); }} rows={2} placeholder={single ? "sunset, coast" : "(leave unchanged)"} />
           </Field>
 

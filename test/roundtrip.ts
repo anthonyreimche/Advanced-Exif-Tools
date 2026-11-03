@@ -3,18 +3,20 @@
 // rename planner. Bundled with rolldown and run under Node.
 
 import {
-  parseTiff, serializeTiff, setAscii, getAscii, ensureExif, type Tiff,
+  parseTiff, serializeTiff, setAscii, getAscii, ensureExif, setRationals, type Tiff,
 } from "../src/metadata/tiff";
 import { getExifTiff, writeExifIntoJpeg } from "../src/metadata/jpeg";
 import { upsertXmp, readXmp, sidecarName, legacySidecarName, isOwnPacket } from "../src/metadata/xmp";
-import { writeSidecar, readSidecarForImport } from "../src/metadata/apply";
+import { writeSidecar, readSidecarForImport, applyMetadata } from "../src/metadata/apply";
 import { readAllTags } from "../src/metadata/exif-read";
 import {
   planRename, renderTemplate, collectUnknownTokens, templateUsesSubsec,
-  DEFAULT_OPTIONS, TOKEN_GROUPS,
+  DEFAULT_OPTIONS, TOKEN_GROUPS, type RenamePlan,
 } from "../src/rename/engine";
+import { applyRename } from "../src/rename/apply";
 import { extractSubsec } from "../src/rename/subsec";
-import type { CatalogPhoto } from "../src/safelight-api";
+import { initRuntime } from "../src/rt";
+import type { CatalogPhoto, RenamePhotoResult, SafelightAPI } from "../src/safelight-api";
 
 let passed = 0;
 let failed = 0;
@@ -169,7 +171,7 @@ function fakeDir(initial: Record<string, string> = {}) {
     files,
     async getFileHandle(name: string, opts?: { create?: boolean }) {
       if (!files.has(name)) {
-        if (!opts?.create) throw new Error("NotFound");
+        if (!opts?.create) throw new DOMException(`${name} not found`, "NotFoundError");
         files.set(name, "");
       }
       return {
@@ -369,6 +371,321 @@ function testSubsec(): void {
   ok("truncated buffer never throws", extractSubsec(whole.subarray(0, 16)) === "");
 }
 
+// ── apply paths, run through a fake api ──────────────────────────────────────
+
+const T_MAKE = 0x010f;
+const T_EXPOSURE = 0x829a;
+const T_MAKERNOTE = 0x927c;
+const MAKERNOTE_SIG = [0x4d, 0x4e, 0x54, 0x45, 0x53, 0x54]; // "MNTEST"
+const BARE_JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0xff, 0xd9]);
+
+function cameraTiff(withMakerNote: boolean): Uint8Array {
+  const tiff: Tiff = { little: true, ifd0: { tags: [] }, complex: false };
+  setAscii(tiff.ifd0, T_MAKE, "TESTCAM");
+  const exif = ensureExif(tiff);
+  setRationals(exif, T_EXPOSURE, [[1, 250]], true);
+  if (withMakerNote) {
+    const note = new Uint8Array(40);
+    note.set(MAKERNOTE_SIG, 0);
+    exif.tags.push({ tag: T_MAKERNOTE, type: 7, count: note.length, bytes: note });
+  }
+  return serializeTiff(tiff);
+}
+
+/** Byte offset of `tag`'s 12-byte entry in IFD0 or the Exif IFD (little-endian). */
+function entryOffset(t: Uint8Array, tag: number, inExif: boolean): number {
+  const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+  const find = (ifd: number, want: number): number => {
+    const n = dv.getUint16(ifd, true);
+    for (let i = 0; i < n; i++) if (dv.getUint16(ifd + 2 + i * 12, true) === want) return ifd + 2 + i * 12;
+    return -1;
+  };
+  const ifd0 = dv.getUint32(4, true);
+  return inExif ? find(dv.getUint32(find(ifd0, 0x8769) + 8, true), tag) : find(ifd0, tag);
+}
+
+function withValue(t: Uint8Array, entry: number, value: number): Uint8Array {
+  const copy = t.slice();
+  new DataView(copy.buffer).setUint32(entry + 8, value, true);
+  return copy;
+}
+
+function indexOfBytes(hay: Uint8Array, needle: number[]): number {
+  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+function fakeFile(initial: Uint8Array, beforeClose?: () => void) {
+  const state = { bytes: initial, writes: 0 };
+  const handle = {
+    async getFile() {
+      return { arrayBuffer: async () => state.bytes.slice().buffer };
+    },
+    async createWritable() {
+      let written = new Uint8Array(0);
+      return {
+        async write(data: unknown) {
+          written = data as Uint8Array;
+        },
+        async close() {
+          await new Promise((r) => setTimeout(r, 5));
+          beforeClose?.();
+          state.bytes = written;
+          state.writes++;
+        },
+      };
+    },
+  };
+  return { state, handle: handle as unknown as FileSystemFileHandle };
+}
+
+function installFakeApi(
+  photos: CatalogPhoto[],
+  renamePhoto: (id: string, base: string) => Promise<RenamePhotoResult> = async () => ({ ok: false, reason: "unused" }),
+) {
+  const relocateSizes: number[] = [];
+  const state = {
+    photos,
+    async relocatePhotos(updated: CatalogPhoto[]) {
+      relocateSizes.push(updated.length);
+      const byId = new Map(updated.map((p) => [p.id, p] as const));
+      state.photos = state.photos.map((p) => byId.get(p.id) ?? p);
+    },
+  };
+  initRuntime({
+    stores: { useCatalogStore: { getState: () => state } },
+    catalog: { renamePhoto },
+  } as unknown as SafelightAPI);
+  return { state, relocateSizes };
+}
+
+async function expectRefused(label: string, tiff: Uint8Array, asTiffFile = false): Promise<void> {
+  const original = asTiffFile ? tiff : writeExifIntoJpeg(BARE_JPEG, tiff);
+  const file = fakeFile(original.slice());
+  const dir = fakeDir();
+  const filename = asTiffFile ? "IMG.TIF" : "IMG.JPG";
+  const photo = fakePhoto({ filename, fileHandle: file.handle, directoryHandle: dir });
+  installFakeApi([photo]);
+  const [r] = await applyMetadata([photo], { artist: "Kim" }, { kind: "none" });
+  ok(`${label}: original untouched`, file.state.writes === 0 && sameBytes(file.state.bytes, original));
+  ok(
+    `${label}: sidecar written`,
+    r.ok && r.mode === "sidecar" && readXmp(dir.files.get(sidecarName(filename)) ?? "").meta.artist === "Kim",
+    JSON.stringify(r),
+  );
+}
+
+/** A TIFF whose IFD0 carries two Exif pointers, each to its own one-tag IFD. */
+function doubleExifTiff(): Uint8Array {
+  const buf = new Uint8Array(86);
+  const dv = new DataView(buf.buffer);
+  const entry = (at: number, tag: number, type: number, value: number) => {
+    dv.setUint16(at, tag, true);
+    dv.setUint16(at + 2, type, true);
+    dv.setUint32(at + 4, 1, true);
+    if (type === 3) dv.setUint16(at + 8, value, true);
+    else dv.setUint32(at + 8, value, true);
+  };
+  dv.setUint16(0, 0x4949, false);
+  dv.setUint16(2, 42, true);
+  dv.setUint32(4, 8, true);
+  dv.setUint16(8, 3, true);
+  entry(10, 0x0100, 3, 2); // ImageWidth
+  entry(22, 0x8769, 4, 50);
+  entry(34, 0x8769, 4, 68);
+  dv.setUint16(50, 1, true);
+  entry(52, 0x8827, 3, 400); // ISO
+  dv.setUint16(68, 1, true);
+  entry(70, 0xa402, 3, 0); // ExposureMode
+  return buf;
+}
+
+async function testInPlaceTiffSafety(): Promise<void> {
+  console.log("In-place TIFF safety:");
+  await expectRefused("rewrite that would drop a tag", doubleExifTiff(), true);
+
+  const longTag = (tag: number, value: number) => {
+    const bytes = new Uint8Array(4);
+    new DataView(bytes.buffer).setUint32(0, value, true);
+    return { tag, type: 4, count: 1, bytes };
+  };
+  const withSubIfds = parseTiff(buildTiff(), 0)!;
+  withSubIfds.ifd0.tags.push(longTag(0x014a, 8));
+  await expectRefused("SubIFDs tag", serializeTiff(withSubIfds), true);
+
+  const stripsAndThumb = parseTiff(buildTiff(), 0)!;
+  stripsAndThumb.ifd0.tags.push(longTag(0x0201, 62), longTag(0x0202, 4));
+  await expectRefused("strips plus a JPEG thumbnail in one IFD", serializeTiff(stripsAndThumb), true);
+
+  const tiff = parseTiff(buildTiff(), 0)!;
+  const note = new Uint8Array(40);
+  note.set(MAKERNOTE_SIG, 0);
+  ensureExif(tiff).tags.push({ tag: T_MAKERNOTE, type: 7, count: note.length, bytes: note });
+  const original = serializeTiff(tiff);
+  const at = indexOfBytes(original, MAKERNOTE_SIG);
+  const file = fakeFile(original.slice());
+  const photo = fakePhoto({ filename: "IMG.TIF", fileHandle: file.handle, directoryHandle: fakeDir() });
+  installFakeApi([photo]);
+  const [r] = await applyMetadata([photo], { artist: "Kim", description: "A caption long enough to grow IFD0" }, { kind: "none" });
+  const re = parseTiff(file.state.bytes, 0);
+  const px = re?.ifd0.blocks?.[0];
+  ok("MakerNote TIFF written in place", r.ok && r.mode === "in-place", JSON.stringify(r));
+  ok("TIFF MakerNote keeps its offset", indexOfBytes(file.state.bytes, MAKERNOTE_SIG) === at, `${at} → ${indexOfBytes(file.state.bytes, MAKERNOTE_SIG)}`);
+  ok("TIFF MakerNote bytes identical", sameBytes(file.state.bytes.subarray(at, at + 40), note));
+  ok("TIFF pixels intact", !!px && sameBytes(px, new Uint8Array([0xde, 0xad, 0xbe, 0xef])));
+  ok("TIFF edit reads back", !!re && getAscii(re.ifd0, 0x013b) === "Kim");
+}
+
+async function testInPlaceJpegSafety(): Promise<void> {
+  console.log("In-place JPEG safety:");
+  await expectRefused("EXIF cut short in its header", new Uint8Array([0x49, 0x49, 0x2a, 0x00, 0x08]));
+
+  const plain = cameraTiff(false);
+  await expectRefused("Exif IFD pointer past the block", withValue(plain, entryOffset(plain, 0x8769, false), 0xfff0));
+
+  const noted = cameraTiff(true);
+  await expectRefused("MakerNote pointer out of range", withValue(noted, entryOffset(noted, T_MAKERNOTE, true), 0xfff0));
+
+  const at = indexOfBytes(noted, MAKERNOTE_SIG);
+  const file = fakeFile(writeExifIntoJpeg(BARE_JPEG, noted));
+  const photo = fakePhoto({ filename: "IMG.JPG", fileHandle: file.handle, directoryHandle: fakeDir() });
+  installFakeApi([photo]);
+  const [r] = await applyMetadata([photo], { artist: "Kim", description: "A caption long enough to grow IFD0" }, { kind: "none" });
+  const out = getExifTiff(file.state.bytes);
+  const re = out ? parseTiff(out, 0) : null;
+  ok("MakerNote JPEG written in place", r.ok && r.mode === "in-place", JSON.stringify(r));
+  ok("MakerNote keeps its TIFF offset", !!out && indexOfBytes(out, MAKERNOTE_SIG) === at, `${at} → ${out ? indexOfBytes(out, MAKERNOTE_SIG) : "none"}`);
+  ok("MakerNote bytes identical", !!out && sameBytes(out.subarray(at, at + 40), noted.subarray(at, at + 40)));
+  ok("camera tags survive", !!re && getAscii(re.ifd0, T_MAKE) === "TESTCAM" && !!re.ifd0.exif?.tags.some((t) => t.tag === T_EXPOSURE));
+  ok("edit reads back", !!re && getAscii(re.ifd0, 0x013b) === "Kim");
+}
+
+async function testCatalogMerge(): Promise<void> {
+  console.log("Catalog update:");
+  let fake: ReturnType<typeof installFakeApi> | null = null;
+  const file = fakeFile(writeExifIntoJpeg(BARE_JPEG, cameraTiff(false)), () => {
+    if (fake) fake.state.photos = fake.state.photos.map((p) => (p.id === "r1" ? { ...p, rating: 5 } : p));
+  });
+  const photo = fakePhoto({ id: "r1", filename: "IMG.JPG", rating: 0, fileHandle: file.handle, directoryHandle: fakeDir() });
+  fake = installFakeApi([photo]);
+  await applyMetadata([photo], { artist: "Kim" }, { kind: "none" });
+  const now = fake.state.photos.find((p) => p.id === "r1");
+  ok("rating set during the write survives", now?.rating === 5, `rating ${now?.rating}`);
+  ok("the edit still lands", now?.exif.artist === "Kim");
+
+  const many = Array.from({ length: 450 }, (_, i) =>
+    fakePhoto({ id: `b${i}`, filename: `DSC${i}.ARW`, directoryHandle: fakeDir() }),
+  );
+  const batch = installFakeApi(many);
+  await applyMetadata(many, { copyright: "C" }, { kind: "none" });
+  ok(
+    "catalog updates are batched",
+    batch.relocateSizes.length === 3 && Math.max(...batch.relocateSizes) <= 200,
+    `${batch.relocateSizes.length} calls`,
+  );
+  ok("every record updated", batch.state.photos.every((p) => p.exif.copyright === "C"));
+}
+
+/** A desktop-style folder: getFileHandle always succeeds and reads fail in
+ *  getFile(), with ENOENT for a missing file or the error given for `name`. */
+function desktopDir(initial: Record<string, string>, failing: Record<string, Error> = {}) {
+  const files = new Map<string, string>(Object.entries(initial));
+  const dir = {
+    files,
+    async getFileHandle(name: string) {
+      return {
+        async getFile() {
+          if (failing[name]) throw failing[name];
+          const text = files.get(name);
+          if (text === undefined) {
+            throw new Error(`Error invoking remote method 'fs:read': Error: ENOENT: no such file or directory, open '${name}'`);
+          }
+          return { text: async () => text };
+        },
+        async createWritable() {
+          let buf = "";
+          return {
+            async write(data: unknown) {
+              buf += new TextDecoder().decode(data as Uint8Array);
+            },
+            async close() {
+              files.set(name, buf);
+            },
+          };
+        },
+      };
+    },
+    async removeEntry(name: string) {
+      files.delete(name);
+    },
+  };
+  return dir as unknown as FileSystemDirectoryHandle & { files: Map<string, string> };
+}
+
+async function testSidecarReadErrors(): Promise<void> {
+  console.log("Sidecar read errors:");
+  const busy = desktopDir(
+    { "DSC1.xmp": DT_LEGACY },
+    { "DSC1.xmp": new Error("Error invoking remote method 'fs:read': Error: EBUSY: resource busy or locked") },
+  );
+  const photo = fakePhoto({ filename: "DSC1.ARW", directoryHandle: busy });
+  installFakeApi([photo]);
+  const [r] = await applyMetadata([photo], { artist: "Kim" }, { kind: "none" });
+  ok("unreadable sidecar is left alone", busy.files.get("DSC1.xmp") === DT_LEGACY);
+  ok("unreadable sidecar fails the photo", !r.ok && (r.reason ?? "").includes("EBUSY"), JSON.stringify(r));
+
+  const empty = desktopDir({});
+  const fresh = fakePhoto({ filename: "DSC2.ARW", directoryHandle: empty });
+  installFakeApi([fresh]);
+  const [r2] = await applyMetadata([fresh], { artist: "Kim" }, { kind: "none" });
+  ok("ENOENT still means no sidecar", r2.ok && readXmp(empty.files.get("DSC2.xmp") ?? "").meta.artist === "Kim", JSON.stringify(r2));
+}
+
+async function testVirtualCopies(): Promise<void> {
+  console.log("Virtual copies:");
+  const original = writeExifIntoJpeg(BARE_JPEG, cameraTiff(false));
+  const file = fakeFile(original.slice());
+  const jpegDir = fakeDir();
+  const jpegCopy = fakePhoto({ id: "c1", filename: "IMG.JPG", copyOf: "m1", fileHandle: file.handle, directoryHandle: jpegDir });
+  const rawDir = fakeDir();
+  const rawCopy = fakePhoto({ id: "c2", filename: "DSC1.ARW", copyOf: "m2", directoryHandle: rawDir });
+  const fake = installFakeApi([jpegCopy, rawCopy]);
+  const results = await applyMetadata([jpegCopy, rawCopy], { artist: "Kim" }, { kind: "none" });
+  ok("JPEG copy leaves the master's file alone", file.state.writes === 0 && sameBytes(file.state.bytes, original));
+  ok("RAW copy writes no sidecar", rawDir.files.size === 0 && jpegDir.files.size === 0);
+  ok("copies are skipped with a reason", results.every((r) => !r.ok && (r.reason ?? "").includes("Virtual copy")), JSON.stringify(results));
+  ok("copy records are not updated", fake.relocateSizes.length === 0);
+}
+
+async function testRenameRecovery(): Promise<void> {
+  console.log("Rename recovery:");
+  const calls: string[] = [];
+  installFakeApi([], async (_id, base) => {
+    calls.push(base);
+    return base.startsWith("__aet_") ? { ok: true, filename: `${base}.jpg` } : { ok: false, reason: "Name taken." };
+  });
+  const plan: RenamePlan = {
+    items: [{ id: "1", oldName: "a.jpg", newName: "b.jpg", newBase: "b", unchanged: false }],
+    duplicates: [],
+    needsTempPass: true,
+    unknownTokens: [],
+  };
+  const out = await applyRename(plan);
+  const temp = `${calls[0]}.jpg`;
+  ok(
+    "failed restore reports the temporary name",
+    out.failed.length === 1 && out.failed[0].reason.includes(`left as ${temp}`),
+    JSON.stringify(out.failed),
+  );
+}
+
 console.log("\nAdvanced EXIF Tools — verification\n");
 testTiffRoundtrip();
 testJpeg();
@@ -377,5 +694,11 @@ testSidecarNaming();
 testRename();
 testSubsec();
 await testSidecarWrite();
+await testInPlaceJpegSafety();
+await testInPlaceTiffSafety();
+await testCatalogMerge();
+await testSidecarReadErrors();
+await testVirtualCopies();
+await testRenameRecovery();
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) throw new Error(`${failed} checks failed`);

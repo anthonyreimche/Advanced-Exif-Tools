@@ -24,6 +24,10 @@ const GPS_LATREF = 0x0001;
 const GPS_LAT = 0x0002;
 const GPS_LONREF = 0x0003;
 const GPS_LON = 0x0004;
+const EXIF_MAKERNOTE = 0x927c;
+
+/** Catalog records stored per relocatePhotos call. */
+const CATALOG_BATCH = 200;
 
 export type WriteMode = "in-place" | "sidecar";
 
@@ -87,6 +91,12 @@ function verifyTags(tiffBytes: Uint8Array, edits: EditableMeta, dateStr: string 
   return true;
 }
 
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /** Deep-compare the external data blocks (strips/tiles/thumbnail) of two IFD
  *  trees, in the same walk order the serializer used. */
 function blocksIntact(a: IfdNode, b: IfdNode): boolean {
@@ -101,24 +111,51 @@ function blocksIntact(a: IfdNode, b: IfdNode): boolean {
   const bb: Uint8Array[] = [];
   collect(a, ba);
   collect(b, bb);
-  if (ba.length !== bb.length) return false;
-  for (let i = 0; i < ba.length; i++) {
-    if (ba[i].length !== bb[i].length) return false;
-    for (let j = 0; j < ba[i].length; j++) if (ba[i][j] !== bb[i][j]) return false;
-  }
-  return true;
+  return ba.length === bb.length && ba.every((block, i) => sameBytes(block, bb[i]));
 }
 
-/** In-place JPEG EXIF. Throws (→ sidecar fallback) if it can't be done safely. */
+/** Every tag id in an IFD tree, keyed by the IFD it sits in, as one string. */
+function tagCensus(root: IfdNode): string {
+  const ids: string[] = [];
+  const walk = (n: IfdNode, path: string) => {
+    for (const t of n.tags) ids.push(`${path}:${t.tag}`);
+    if (n.exif) walk(n.exif, `${path}.exif`);
+    if (n.gps) walk(n.gps, `${path}.gps`);
+    if (n.interop) walk(n.interop, `${path}.interop`);
+    if (n.next) walk(n.next, `${path}.next`);
+  };
+  walk(root, "ifd0");
+  return ids.sort().join(",");
+}
+
+/** Apply the edits to a parsed, non-complex TIFF and re-serialize it, throwing
+ *  (→ sidecar fallback) unless the rewrite re-parses, carries every tag across,
+ *  keeps any maker note at its offset and reads the edits back. */
+function rewriteChecked(tiff: Tiff, edits: EditableMeta, dateStr: string | null): { out: Uint8Array; reparsed: Tiff } {
+  const makerNote = tiff.ifd0.exif?.tags.find((t) => t.tag === EXIF_MAKERNOTE && t.at !== undefined);
+  applyEditsToTiff(tiff, edits, dateStr);
+  const out = serializeTiff(tiff, makerNote);
+  const reparsed = parseTiff(out, 0);
+  if (!reparsed || reparsed.complex) throw new Error("Rewritten EXIF failed to re-parse.");
+  if (tagCensus(reparsed.ifd0) !== tagCensus(tiff.ifd0)) throw new Error("Rewritten EXIF lost tags.");
+  if (makerNote) {
+    const kept = reparsed.ifd0.exif?.tags.find((t) => t.tag === EXIF_MAKERNOTE);
+    const same = !!kept?.bytes && !!makerNote.bytes && kept.at === makerNote.at && sameBytes(kept.bytes, makerNote.bytes);
+    if (!same) throw new Error("Maker note couldn't keep its position.");
+  }
+  if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
+  return { out, reparsed };
+}
+
+/** In-place JPEG EXIF. Throws (→ sidecar fallback) if it can't be done safely,
+ *  including when an EXIF block is present but can't be read in full. */
 function editJpeg(buf: Uint8Array, edits: EditableMeta, dateStr: string | null): Uint8Array {
   const existing = getExifTiff(buf);
-  const tiff: Tiff = existing
-    ? parseTiff(existing, 0) ?? { little: true, ifd0: { tags: [] }, complex: false }
-    : { little: true, ifd0: { tags: [] }, complex: false };
-  applyEditsToTiff(tiff, edits, dateStr);
-  const out = serializeTiff(tiff);
-  if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
-  return writeExifIntoJpeg(buf, out);
+  const parsed = existing ? parseTiff(existing, 0) : null;
+  if (existing && !parsed) throw new Error("Existing EXIF couldn't be read.");
+  if (parsed?.complex) throw new Error("EXIF layout too complex to rewrite in place.");
+  const tiff: Tiff = parsed ?? { little: true, ifd0: { tags: [] }, complex: false };
+  return writeExifIntoJpeg(buf, rewriteChecked(tiff, edits, dateStr).out);
 }
 
 /** In-place TIFF EXIF. Throws (→ sidecar fallback) for complex layouts or if the
@@ -127,12 +164,8 @@ function editTiff(buf: Uint8Array, edits: EditableMeta, dateStr: string | null):
   const tiff = parseTiff(buf, 0);
   if (!tiff) throw new Error("Not a parseable TIFF.");
   if (tiff.complex) throw new Error("TIFF layout too complex to rewrite in place.");
-  applyEditsToTiff(tiff, edits, dateStr);
-  const out = serializeTiff(tiff);
-  const reparsed = parseTiff(out, 0);
-  if (!reparsed || reparsed.complex) throw new Error("Rewritten TIFF failed to re-parse.");
+  const { out, reparsed } = rewriteChecked(tiff, edits, dateStr);
   if (!blocksIntact(tiff.ifd0, reparsed.ifd0)) throw new Error("Pixel data check failed.");
-  if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
   return out;
 }
 
@@ -142,12 +175,24 @@ async function writeBytes(handle: FileSystemFileHandle, data: Uint8Array): Promi
   await w.close();
 }
 
+/** A missing file: the browser file API's NotFoundError, or ENOENT from the
+ *  desktop bridge, which keeps the errno only in the message. */
+function isNotFound(e: unknown): boolean {
+  return e instanceof Error && (e.name === "NotFoundError" || /\bENOENT\b/.test(e.message));
+}
+
+/** The sidecar's text, or null when there is none. Any other read failure (a
+ *  locked file, a dropped share) throws: writing a fresh packet over a sidecar
+ *  we couldn't read would wipe another app's settings. On desktop a missing file
+ *  only fails in getFile(), so both steps sit in the one try. */
 async function sidecarText(dir: FileSystemDirectoryHandle, name: string): Promise<string | null> {
   try {
     const fh = await dir.getFileHandle(name);
     return await (await fh.getFile()).text();
-  } catch {
-    return null; // no sidecar
+  } catch (e) {
+    if (isNotFound(e)) return null;
+    const why = e instanceof Error ? e.message : String(e);
+    throw new Error(`Couldn't read the existing ${name}, so it was left as it is (${why})`);
   }
 }
 
@@ -178,10 +223,9 @@ export async function writeSidecar(photo: CatalogPhoto, edits: EditableMeta, dat
   }
 }
 
-/** Reflect the edits into the catalog record so the grid/info update this
- *  session and survive a reload of catalog.json. */
-async function updateCatalog(photo: CatalogPhoto, edits: EditableMeta, dateStr: string | null): Promise<void> {
-  const exif = { ...photo.exif };
+/** `current` with only the fields this tool edits changed on it. */
+function withEdits(current: CatalogPhoto, edits: EditableMeta, dateStr: string | null): CatalogPhoto {
+  const exif = { ...current.exif };
   if (edits.artist !== undefined) exif.artist = edits.artist || undefined;
   if (edits.copyright !== undefined) exif.copyright = edits.copyright || undefined;
   if (edits.description !== undefined) exif.imageDescription = edits.description || undefined;
@@ -190,9 +234,37 @@ async function updateCatalog(photo: CatalogPhoto, edits: EditableMeta, dateStr: 
     exif.gpsLatitude = edits.gpsLat;
     exif.gpsLongitude = edits.gpsLon;
   }
-  const updated: CatalogPhoto = { ...photo, exif };
+  const updated: CatalogPhoto = { ...current, exif };
   if (edits.keywords !== undefined) updated.keywords = [...edits.keywords];
-  await api.stores.useCatalogStore.getState().relocatePhotos([updated]);
+  return updated;
+}
+
+interface Written {
+  id: string;
+  dateStr: string | null;
+  result: WriteResult;
+}
+
+/** Reflect written edits into the catalog so the grid/info update this session
+ *  and survive a reload. Each record is rebuilt from the store as it is now, so
+ *  a rating, flag or keyword changed while the files were written stays. */
+async function updateCatalog(written: Written[], edits: EditableMeta): Promise<void> {
+  if (written.length === 0) return;
+  const store = api.stores.useCatalogStore.getState();
+  const byId = new Map(written.map((w) => [w.id, w] as const));
+  const updated: CatalogPhoto[] = [];
+  for (const p of store.photos) {
+    const w = byId.get(p.id);
+    if (w) updated.push(withEdits(p, edits, w.dateStr));
+  }
+  try {
+    await store.relocatePhotos(updated);
+  } catch (e) {
+    for (const w of written) {
+      w.result.ok = false;
+      w.result.reason = e instanceof Error ? e.message : "Catalog update failed";
+    }
+  }
 }
 
 export interface ApplyProgress {
@@ -209,12 +281,19 @@ export async function applyMetadata(
   onProgress?: (p: ApplyProgress) => void,
 ): Promise<WriteResult[]> {
   const results: WriteResult[] = [];
+  let pending: Written[] = [];
   let done = 0;
 
   for (const photo of targets) {
     onProgress?.({ done, total: targets.length, current: photo.filename });
     const dateStr = resolveDate(dateOp, photo);
 
+    if (photo.copyOf) {
+      // A copy shares its master's file and sidecar; writing would change the master.
+      results.push({ id: photo.id, name: photo.filename, ok: false, mode: "sidecar", reason: "Virtual copy (edit the original)" });
+      done++;
+      continue;
+    }
     if (!hasAnyEdit(edits, dateStr)) {
       results.push({ id: photo.id, name: photo.filename, ok: true, mode: "in-place", reason: "No change" });
       done++;
@@ -248,8 +327,13 @@ export async function applyMetadata(
       } else {
         await writeSidecar(photo, edits, dateStr);
       }
-      await updateCatalog(photo, edits, dateStr);
-      results.push({ id: photo.id, name: photo.filename, ok: true, mode, reason });
+      const result: WriteResult = { id: photo.id, name: photo.filename, ok: true, mode, reason };
+      results.push(result);
+      pending.push({ id: photo.id, dateStr, result });
+      if (pending.length >= CATALOG_BATCH) {
+        await updateCatalog(pending, edits);
+        pending = [];
+      }
     } catch (e) {
       results.push({
         id: photo.id,
@@ -261,6 +345,7 @@ export async function applyMetadata(
     }
     done++;
   }
+  await updateCatalog(pending, edits);
 
   onProgress?.({ done, total: targets.length, current: "" });
   return results;
