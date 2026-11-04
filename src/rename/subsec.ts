@@ -1,4 +1,4 @@
-// EXIF subseconds for the {subsec} token. Core's catalog EXIF doesn't carry
+// EXIF subseconds for the {subsec} token. Core's catalogue EXIF doesn't carry
 // SubSecTime, so the value is read from the file itself with the shared TIFF
 // parser and cached per photo for the session (capture subseconds never change
 // once shot; our own metadata writers don't touch these tags).

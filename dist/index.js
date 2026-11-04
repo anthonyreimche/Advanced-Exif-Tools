@@ -197,7 +197,7 @@ const TOKEN_GROUPS = [
 		]
 	}
 ];
-/** Every recognised bare token id (without args), for validation. */
+/** Every recognized bare token id (without args), for validation. */
 const KNOWN_TOKENS = /* @__PURE__ */ new Set([
 	"name",
 	"seq",
@@ -254,7 +254,7 @@ function seqLetter(index) {
 	} while (n >= 0);
 	return out;
 }
-/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalog's
+/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalogue's
 *  dateCreated. Returns null when neither is usable (date tokens → ""). */
 function captureDate(photo) {
 	const raw = photo.exif.dateTimeOriginal;
@@ -340,7 +340,7 @@ function templateUsesSubsec(template) {
 	for (const m of template.matchAll(TOKEN_RE)) if (m[1].toLowerCase() === "subsec") return true;
 	return false;
 }
-/** Token ids present in the template that aren't recognised — for a live
+/** Token ids present in the template that aren't recognized — for a live
 *  "unknown token" hint. `letter`/`LETTER` both fold to the known "letter". */
 function collectUnknownTokens(template) {
 	const seen = /* @__PURE__ */ new Set();
@@ -423,6 +423,7 @@ const TAG_TILE_OFFSETS = 324;
 const TAG_TILE_BYTECOUNTS = 325;
 const TAG_JPEG_THUMB_OFFSET = 513;
 const TAG_JPEG_THUMB_LENGTH = 514;
+const TAG_SUB_IFDS = 330;
 var Reader = class {
 	view;
 	base;
@@ -469,7 +470,10 @@ function readIfd(buf, r, ifdOffset, depth, state) {
 	let byteCountsTag;
 	for (let i = 0; i < count; i++) {
 		const entryOff = ifdOffset + 2 + i * 12;
-		if (r.base + entryOff + 12 > buf.byteLength) break;
+		if (r.base + entryOff + 12 > buf.byteLength) {
+			state.complex = true;
+			break;
+		}
 		const tag = r.u16(entryOff);
 		const type = r.u16(entryOff + 2);
 		const cnt = r.u32(entryOff + 4);
@@ -478,10 +482,14 @@ function readIfd(buf, r, ifdOffset, depth, state) {
 		const dataOff = size <= 4 ? valueFieldOff : r.u32(valueFieldOff);
 		const absData = r.base + dataOff;
 		if (tag === TAG_EXIF_IFD || tag === TAG_GPS_IFD || tag === TAG_INTEROP_IFD) {
-			const sub = readIfd(buf, r, r.u32(valueFieldOff), depth + 1, state);
-			if (sub) if (tag === TAG_EXIF_IFD) node.exif = sub;
-			else if (tag === TAG_GPS_IFD) node.gps = sub;
-			else node.interop = sub;
+			const pointer = r.u32(valueFieldOff);
+			const sub = readIfd(buf, r, pointer, depth + 1, state);
+			if (!sub && pointer !== 0) state.complex = true;
+			if (sub) {
+				const slot = tag === TAG_EXIF_IFD ? "exif" : tag === TAG_GPS_IFD ? "gps" : "interop";
+				if (node[slot]) state.complex = true;
+				node[slot] = sub;
+			}
 			continue;
 		}
 		if (size > 4 && (absData < 0 || absData + size > buf.byteLength)) {
@@ -492,11 +500,15 @@ function readIfd(buf, r, ifdOffset, depth, state) {
 			tag,
 			type,
 			count: cnt,
-			bytes: buf.subarray(absData, absData + size)
+			bytes: buf.subarray(absData, absData + size),
+			at: size > 4 ? dataOff : void 0
 		};
 		node.tags.push(t);
-		if (tag === TAG_STRIP_OFFSETS || tag === TAG_TILE_OFFSETS || tag === TAG_JPEG_THUMB_OFFSET) offsetTag = tag;
-		else if (tag === TAG_STRIP_BYTECOUNTS || tag === TAG_TILE_BYTECOUNTS || tag === TAG_JPEG_THUMB_LENGTH) byteCountsTag = tag;
+		if (tag === TAG_SUB_IFDS) state.complex = true;
+		if (tag === TAG_STRIP_OFFSETS || tag === TAG_TILE_OFFSETS || tag === TAG_JPEG_THUMB_OFFSET) {
+			if (offsetTag !== void 0) state.complex = true;
+			offsetTag = tag;
+		} else if (tag === TAG_STRIP_BYTECOUNTS || tag === TAG_TILE_BYTECOUNTS || tag === TAG_JPEG_THUMB_LENGTH) byteCountsTag = tag;
 	}
 	if (offsetTag !== void 0) {
 		const offs = readIntTag(r, node, offsetTag);
@@ -521,7 +533,14 @@ function readIfd(buf, r, ifdOffset, depth, state) {
 			}
 		}
 	}
-	node.next = readIfd(buf, r, r.u32(ifdOffset + 2 + count * 12), depth + 1, state) ?? void 0;
+	const nextField = ifdOffset + 2 + count * 12;
+	if (r.base + nextField + 4 > buf.byteLength) {
+		state.complex = true;
+		return node;
+	}
+	const nextOffset = r.u32(nextField);
+	node.next = readIfd(buf, r, nextOffset, depth + 1, state) ?? void 0;
+	if (!node.next && nextOffset !== 0) state.complex = true;
 	return node;
 }
 /** Decode an integer tag (BYTE/SHORT/LONG) already captured in `node.tags`. */
@@ -600,7 +619,7 @@ function setRationals(node, tag, pairs, little, signed = false) {
 	else node.tags.push(t);
 }
 const align2 = (n) => n & 1 ? n + 1 : n;
-function plannedEntriesFor(node, little) {
+function plannedEntriesFor(node, little, keep) {
 	const entries = [];
 	for (const t of node.tags) if (t.tag === node.offsetTag) entries.push({
 		tag: t.tag,
@@ -608,12 +627,16 @@ function plannedEntriesFor(node, little) {
 		count: t.count,
 		offsetKind: true
 	});
-	else if (t.bytes) entries.push({
-		tag: t.tag,
-		type: t.type,
-		count: t.count,
-		bytes: t.bytes
-	});
+	else if (t.bytes) {
+		const fixedAt = t === keep ? t.at : void 0;
+		entries.push({
+			tag: t.tag,
+			type: t.type,
+			count: t.count,
+			bytes: t.bytes,
+			fixedAt
+		});
+	}
 	if (node.exif) entries.push({
 		tag: TAG_EXIF_IFD,
 		type: 4,
@@ -635,9 +658,24 @@ function plannedEntriesFor(node, little) {
 	entries.sort((a, b) => a.tag - b.tag);
 	return entries;
 }
-/** Re-serialize `tiff` to a standalone TIFF byte buffer. */
-function serializeTiff(tiff) {
+/** Re-serialize `tiff` to a standalone TIFF byte buffer. `keep`, a parsed
+*  out-of-line tag, has its value written back at its original offset with
+*  everything else laid out around it: maker notes often address their own data
+*  by offsets from the TIFF header, which only stay valid if the note stays put. */
+function serializeTiff(tiff, keep) {
 	const little = tiff.little;
+	const reserved = keep?.at !== void 0 && keep.bytes ? {
+		start: keep.at,
+		end: keep.at + keep.bytes.length
+	} : null;
+	if (reserved && reserved.start < 8) throw new Error("Kept value overlaps the TIFF header.");
+	let cursor = 8;
+	const alloc = (len) => {
+		if (reserved && len > 0 && cursor < reserved.end && cursor + len > reserved.start) cursor = align2(reserved.end);
+		const at = cursor;
+		cursor = align2(at + len);
+		return at;
+	};
 	const order = [];
 	const walk = (n) => {
 		order.push(n);
@@ -648,17 +686,16 @@ function serializeTiff(tiff) {
 	};
 	walk(tiff.ifd0);
 	const planned = [];
-	let cursor = 8;
 	for (const node of order) {
-		const entries = plannedEntriesFor(node, little);
-		const ifdOffset = cursor;
-		const entriesSize = 2 + entries.length * 12 + 4;
+		const entries = plannedEntriesFor(node, little, keep);
+		const ifdOffset = alloc(2 + entries.length * 12 + 4);
 		let dataSize = 0;
 		for (const e of entries) {
+			if (e.fixedAt !== void 0) continue;
 			const len = e.offsetKind ? e.count * 4 : e.bytes ? e.bytes.length : 0;
 			if (len > 4) dataSize += align2(len);
 		}
-		const dataOffset = ifdOffset + entriesSize;
+		const dataOffset = alloc(dataSize);
 		planned.push({
 			node,
 			entries,
@@ -666,19 +703,14 @@ function serializeTiff(tiff) {
 			dataOffset,
 			dataSize
 		});
-		cursor = dataOffset + dataSize;
 	}
 	const blockOffsets = /* @__PURE__ */ new Map();
 	for (const node of order) {
 		if (!node.blocks) continue;
-		const offs = [];
-		for (const b of node.blocks) {
-			offs.push(cursor);
-			cursor = align2(cursor + b.length);
-		}
-		blockOffsets.set(node, offs);
+		blockOffsets.set(node, node.blocks.map((b) => alloc(b.length)));
 	}
-	const out = new Uint8Array(cursor);
+	const total = Math.max(cursor, reserved?.end ?? 0);
+	const out = new Uint8Array(total);
 	const dv = new DataView(out.buffer);
 	const nodeToPlan = new Map(planned.map((p) => [p.node, p]));
 	dv.setUint16(0, little ? 18761 : 19789, false);
@@ -711,7 +743,10 @@ function serializeTiff(tiff) {
 			dv.setUint16(entryOff + 2, type, little);
 			dv.setUint32(entryOff + 4, count, little);
 			if (valueBytes.length <= 4) out.set(valueBytes, entryOff + 8);
-			else {
+			else if (e.fixedAt !== void 0) {
+				dv.setUint32(entryOff + 8, e.fixedAt, little);
+				out.set(valueBytes, e.fixedAt);
+			} else {
 				dv.setUint32(entryOff + 8, dataPtr, little);
 				out.set(valueBytes, dataPtr);
 				dataPtr = align2(dataPtr + valueBytes.length);
@@ -999,7 +1034,10 @@ async function harvestSubsec(photos) {
 //#region src/rename/apply.ts
 async function rename(id, base) {
 	const r = await api.catalog.renamePhoto(id, base);
-	return r.ok ? { ok: true } : {
+	return r.ok ? {
+		ok: true,
+		filename: r.filename
+	} : {
 		ok: false,
 		reason: r.reason
 	};
@@ -1023,27 +1061,30 @@ async function applyRename(plan, onProgress) {
 	});
 	const nonce = Date.now().toString(36);
 	if (plan.needsTempPass) {
-		const staged = /* @__PURE__ */ new Set();
+		const staged = /* @__PURE__ */ new Map();
 		for (let i = 0; i < active.length; i++) {
 			const it = active[i];
-			const r = await rename(it.id, `__aet_${nonce}_${i}`);
-			if (r.ok) staged.add(it.id);
+			const tempBase = `__aet_${nonce}_${i}`;
+			const r = await rename(it.id, tempBase);
+			if (r.ok) staged.set(it.id, r.filename ?? tempBase);
 			else outcome.failed.push({
 				name: it.oldName,
 				reason: r.reason ?? "Rename failed."
 			});
 		}
 		for (const it of active) {
-			if (!staged.has(it.id)) continue;
+			const tempName = staged.get(it.id);
+			if (tempName === void 0) continue;
 			report(it.newName);
 			const r = await rename(it.id, it.newBase);
 			if (r.ok) outcome.renamed++;
 			else {
 				const origBase = it.oldName.replace(/\.[^.]+$/, "");
-				await rename(it.id, origBase);
+				const restored = await rename(it.id, origBase);
+				const reason = r.reason ?? "Rename failed.";
 				outcome.failed.push({
 					name: it.oldName,
-					reason: r.reason ?? "Rename failed."
+					reason: restored.ok ? reason : `${reason} Restoring the name failed too, so it was left as ${tempName}.`
 				});
 			}
 			done++;
@@ -1466,6 +1507,27 @@ const NS = {
 	exif: "http://ns.adobe.com/exif/1.0/",
 	xmp: "http://ns.adobe.com/xap/1.0/"
 };
+const XMPTK = "Advanced EXIF Tools";
+const RAW_EXT = /^(nef|cr2|cr3|crw|dng|arw|orf|raf|rw2|pef|srw|3fr|dcr|erf|kdc|mos|raw|nrw)$/i;
+/** Adobe/Lightroom sidecar convention, shared with the XMP Tools extension:
+*  DSC.ARW → DSC.xmp; IMG.JPG → IMG_jpg.xmp; extension-less → name.xmp. */
+function sidecarName(imageFilename) {
+	const dot = imageFilename.lastIndexOf(".");
+	if (dot === -1) return `${imageFilename}.xmp`;
+	const base = imageFilename.slice(0, dot);
+	const ext = imageFilename.slice(dot + 1).toLowerCase();
+	return RAW_EXT.test(ext) ? `${base}.xmp` : `${base}_${ext}.xmp`;
+}
+/** The pre-1.2 name (full filename + ".xmp"), still read for migration. */
+function legacySidecarName(imageFilename) {
+	return `${imageFilename}.xmp`;
+}
+/** True only for packets this extension created from scratch. darktable uses
+*  the same legacy naming for its sidecars, so migration may delete a legacy
+*  file only when this marker proves it is ours. */
+function isOwnPacket(text) {
+	return text.includes(`x:xmptk="${XMPTK}"`);
+}
 function esc(s) {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
@@ -1522,11 +1584,7 @@ function managedElements(fields) {
 	return out;
 }
 function freshPacket(inner) {
-	return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Advanced EXIF Tools">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-    xmlns:dc="${NS.dc}"\n    xmlns:exif="${NS.exif}"\n    xmlns:xmp="${NS.xmp}">\n   ${inner}\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>`;
+	return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="${XMPTK}">\n <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n  <rdf:Description rdf:about=""\n    xmlns:dc="${NS.dc}"\n    xmlns:exif="${NS.exif}"\n    xmlns:xmp="${NS.xmp}">\n   ${inner}\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>`;
 }
 /** Produce updated XMP text carrying `fields`, preserving foreign properties in
 *  an existing packet. */
@@ -1535,6 +1593,7 @@ function upsertXmp(existing, fields) {
 	const additions = managed.filter((m) => m.xml).map((m) => m.xml);
 	if (!existing || !/<rdf:Description[\s>]/.test(existing)) return freshPacket(additions.join("\n   "));
 	let text = existing;
+	text = text.replace(/<rdf:Description\b([^>]*?)\/\s*>/, "<rdf:Description$1></rdf:Description>");
 	for (const m of managed) {
 		const re = new RegExp(`\\s*<${m.tag}[\\s\\S]*?<\\/${m.tag}>`, "g");
 		text = text.replace(re, "");
@@ -1548,7 +1607,7 @@ function upsertXmp(existing, fields) {
 		return `<rdf:Description${a}>`;
 	});
 	const insertion = additions.length ? `   ${additions.join("\n   ")}\n  ` : "";
-	return text.replace(/<\/rdf:Description>/, `${insertion}</rdf:Description>`);
+	return text.replace(/<\/rdf:Description>/, () => `${insertion}</rdf:Description>`);
 }
 function firstAltOrSeq(xmp, tag) {
 	const block = new RegExp(`<${tag}[\\s\\S]*?>([\\s\\S]*?)</${tag}>`).exec(xmp);
@@ -1571,6 +1630,13 @@ function bagItems(xmp, tag) {
 	}
 	return items;
 }
+/** XMP "DDD,MM.mmmmH" or "DDD,MM,SSH" GPS coordinate → signed decimal degrees. */
+function xmpGpsToDecimal(value) {
+	const m = value.trim().match(/^(\d+),(\d+(?:\.\d+)?)(?:,(\d+(?:\.\d+)?))?\s*([NSEW])$/i);
+	if (!m) return void 0;
+	const deg = Number(m[1]) + Number(m[2]) / 60 + (m[3] ? Number(m[3]) / 3600 : 0);
+	return /^[SW]$/i.test(m[4]) ? -deg : deg;
+}
 /** Parse the fields we manage out of an XMP sidecar's text. */
 function readXmp(text) {
 	const meta = {};
@@ -1582,6 +1648,16 @@ function readXmp(text) {
 	if (desc) meta.description = desc;
 	const kws = bagItems(text, "dc:subject");
 	if (kws.length) meta.keywords = kws;
+	const coord = (tag) => {
+		const el = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text) ?? new RegExp(`\\s${tag}="([^"]*)"`).exec(text);
+		return el ? xmpGpsToDecimal(unesc(el[1])) : void 0;
+	};
+	const lat = coord("exif:GPSLatitude");
+	const lon = coord("exif:GPSLongitude");
+	if (lat !== void 0 && lon !== void 0) {
+		meta.gpsLat = lat;
+		meta.gpsLon = lon;
+	}
 	const out = { meta };
 	const iso = /<exif:DateTimeOriginal>([\s\S]*?)<\/exif:DateTimeOriginal>/.exec(text) ?? new RegExp(`\\sexif:DateTimeOriginal="([^"]*)"`).exec(text);
 	if (iso) {
@@ -1604,6 +1680,9 @@ const GPS_LATREF = 1;
 const GPS_LAT = 2;
 const GPS_LONREF = 3;
 const GPS_LON = 4;
+const EXIF_MAKERNOTE = 37500;
+/** Catalogue records stored per relocatePhotos call. */
+const CATALOG_BATCH = 200;
 function extOf(filename) {
 	const i = filename.lastIndexOf(".");
 	return i >= 0 ? filename.slice(i + 1).toLowerCase() : "";
@@ -1612,7 +1691,7 @@ function hasAnyEdit(edits, dateStr) {
 	return dateStr != null || edits.artist !== void 0 || edits.copyright !== void 0 || edits.description !== void 0 || edits.keywords !== void 0 || edits.gpsLat !== void 0 && edits.gpsLon !== void 0;
 }
 /** Mutate a parsed TIFF with the requested edits (excluding keywords, which
-*  have no native EXIF tag and ride along in the catalog / sidecar). */
+*  have no native EXIF tag and ride along in the catalogue / sidecar). */
 function applyEditsToTiff(tiff, edits, dateStr) {
 	if (edits.artist !== void 0) setAscii(tiff.ifd0, IFD0_ARTIST, edits.artist || void 0);
 	if (edits.copyright !== void 0) setAscii(tiff.ifd0, IFD0_COPYRIGHT, edits.copyright || void 0);
@@ -1644,6 +1723,11 @@ function verifyTags(tiffBytes, edits, dateStr) {
 	if (dateStr && getAscii(t.ifd0.exif, EXIF_DTO) !== dateStr) return false;
 	return true;
 }
+function sameBytes(a, b) {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
 /** Deep-compare the external data blocks (strips/tiles/thumbnail) of two IFD
 *  trees, in the same walk order the serializer used. */
 function blocksIntact(a, b) {
@@ -1658,29 +1742,53 @@ function blocksIntact(a, b) {
 	const bb = [];
 	collect(a, ba);
 	collect(b, bb);
-	if (ba.length !== bb.length) return false;
-	for (let i = 0; i < ba.length; i++) {
-		if (ba[i].length !== bb[i].length) return false;
-		for (let j = 0; j < ba[i].length; j++) if (ba[i][j] !== bb[i][j]) return false;
-	}
-	return true;
+	return ba.length === bb.length && ba.every((block, i) => sameBytes(block, bb[i]));
 }
-/** In-place JPEG EXIF. Throws (→ sidecar fallback) if it can't be done safely. */
+/** Every tag id in an IFD tree, keyed by the IFD it sits in, as one string. */
+function tagCensus(root) {
+	const ids = [];
+	const walk = (n, path) => {
+		for (const t of n.tags) ids.push(`${path}:${t.tag}`);
+		if (n.exif) walk(n.exif, `${path}.exif`);
+		if (n.gps) walk(n.gps, `${path}.gps`);
+		if (n.interop) walk(n.interop, `${path}.interop`);
+		if (n.next) walk(n.next, `${path}.next`);
+	};
+	walk(root, "ifd0");
+	return ids.sort().join(",");
+}
+/** Apply the edits to a parsed, non-complex TIFF and re-serialize it, throwing
+*  (→ sidecar fallback) unless the rewrite re-parses, carries every tag across,
+*  keeps any maker note at its offset and reads the edits back. */
+function rewriteChecked(tiff, edits, dateStr) {
+	const makerNote = tiff.ifd0.exif?.tags.find((t) => t.tag === EXIF_MAKERNOTE && t.at !== void 0);
+	applyEditsToTiff(tiff, edits, dateStr);
+	const out = serializeTiff(tiff, makerNote);
+	const reparsed = parseTiff(out, 0);
+	if (!reparsed || reparsed.complex) throw new Error("Rewritten EXIF failed to re-parse.");
+	if (tagCensus(reparsed.ifd0) !== tagCensus(tiff.ifd0)) throw new Error("Rewritten EXIF lost tags.");
+	if (makerNote) {
+		const kept = reparsed.ifd0.exif?.tags.find((t) => t.tag === EXIF_MAKERNOTE);
+		if (!(!!kept?.bytes && !!makerNote.bytes && kept.at === makerNote.at && sameBytes(kept.bytes, makerNote.bytes))) throw new Error("Maker note couldn't keep its position.");
+	}
+	if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
+	return {
+		out,
+		reparsed
+	};
+}
+/** In-place JPEG EXIF. Throws (→ sidecar fallback) if it can't be done safely,
+*  including when an EXIF block is present but can't be read in full. */
 function editJpeg(buf, edits, dateStr) {
 	const existing = getExifTiff(buf);
-	const tiff = existing ? parseTiff(existing, 0) ?? {
+	const parsed = existing ? parseTiff(existing, 0) : null;
+	if (existing && !parsed) throw new Error("Existing EXIF couldn't be read.");
+	if (parsed?.complex) throw new Error("EXIF layout too complex to rewrite in place.");
+	return writeExifIntoJpeg(buf, rewriteChecked(parsed ?? {
 		little: true,
 		ifd0: { tags: [] },
 		complex: false
-	} : {
-		little: true,
-		ifd0: { tags: [] },
-		complex: false
-	};
-	applyEditsToTiff(tiff, edits, dateStr);
-	const out = serializeTiff(tiff);
-	if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
-	return writeExifIntoJpeg(buf, out);
+	}, edits, dateStr).out);
 }
 /** In-place TIFF EXIF. Throws (→ sidecar fallback) for complex layouts or if the
 *  round-trip validation (tags + untouched pixel blocks) doesn't hold. */
@@ -1688,12 +1796,8 @@ function editTiff(buf, edits, dateStr) {
 	const tiff = parseTiff(buf, 0);
 	if (!tiff) throw new Error("Not a parseable TIFF.");
 	if (tiff.complex) throw new Error("TIFF layout too complex to rewrite in place.");
-	applyEditsToTiff(tiff, edits, dateStr);
-	const out = serializeTiff(tiff);
-	const reparsed = parseTiff(out, 0);
-	if (!reparsed || reparsed.complex) throw new Error("Rewritten TIFF failed to re-parse.");
+	const { out, reparsed } = rewriteChecked(tiff, edits, dateStr);
 	if (!blocksIntact(tiff.ifd0, reparsed.ifd0)) throw new Error("Pixel data check failed.");
-	if (!verifyTags(out, edits, dateStr)) throw new Error("EXIF verification failed.");
 	return out;
 }
 async function writeBytes(handle, data) {
@@ -1701,26 +1805,48 @@ async function writeBytes(handle, data) {
 	await w.write(data);
 	await w.close();
 }
+/** A missing file: the browser file API's NotFoundError, or ENOENT from the
+*  desktop bridge, which keeps the errno only in the message. */
+function isNotFound(e) {
+	return e instanceof Error && (e.name === "NotFoundError" || /\bENOENT\b/.test(e.message));
+}
+/** The sidecar's text, or null when there is none. Any other read failure (a
+*  locked file, a dropped share) throws: writing a fresh packet over a sidecar
+*  we couldn't read would wipe another app's settings. On desktop a missing file
+*  only fails in getFile(), so both steps sit in the one try. */
+async function sidecarText(dir, name) {
+	try {
+		return await (await (await dir.getFileHandle(name)).getFile()).text();
+	} catch (e) {
+		if (isNotFound(e)) return null;
+		const why = e instanceof Error ? e.message : String(e);
+		throw new Error(`Couldn't read the existing ${name}, so it was left as it is (${why})`);
+	}
+}
+/** Write the sidecar under the Adobe naming shared with the XMP Tools
+*  extension (DSC.ARW → DSC.xmp), seeding from — and migrating away — the
+*  pre-1.2 `<filename>.xmp` name. The legacy file is deleted only when its
+*  packet is provably ours: darktable uses the same legacy naming, and its
+*  sidecars are not ours to remove. Exported for the node test harness. */
 async function writeSidecar(photo, edits, dateStr) {
 	const dir = photo.directoryHandle;
 	if (!dir) throw new Error("No folder handle for this photo.");
-	const name = `${photo.filename}.xmp`;
-	let existing = null;
-	try {
-		existing = await (await (await dir.getFileHandle(name)).getFile()).text();
-	} catch {
-		existing = null;
-	}
-	const text = upsertXmp(existing, {
+	const name = sidecarName(photo.filename);
+	const legacyName = legacySidecarName(photo.filename);
+	const existing = await sidecarText(dir, name);
+	const legacy = name === legacyName ? null : await sidecarText(dir, legacyName);
+	const text = upsertXmp(existing ?? legacy, {
 		meta: edits,
 		date: dateStr ?? void 0
 	});
 	await writeBytes(await dir.getFileHandle(name, { create: true }), new TextEncoder().encode(text));
+	if (legacy !== null && isOwnPacket(legacy)) try {
+		await dir.removeEntry(legacyName);
+	} catch {}
 }
-/** Reflect the edits into the catalog record so the grid/info update this
-*  session and survive a reload of catalog.json. */
-async function updateCatalog(photo, edits, dateStr) {
-	const exif = { ...photo.exif };
+/** `current` with only the fields this tool edits changed on it. */
+function withEdits(current, edits, dateStr) {
+	const exif = { ...current.exif };
 	if (edits.artist !== void 0) exif.artist = edits.artist || void 0;
 	if (edits.copyright !== void 0) exif.copyright = edits.copyright || void 0;
 	if (edits.description !== void 0) exif.imageDescription = edits.description || void 0;
@@ -1730,15 +1856,37 @@ async function updateCatalog(photo, edits, dateStr) {
 		exif.gpsLongitude = edits.gpsLon;
 	}
 	const updated = {
-		...photo,
+		...current,
 		exif
 	};
 	if (edits.keywords !== void 0) updated.keywords = [...edits.keywords];
-	await api.stores.useCatalogStore.getState().relocatePhotos([updated]);
+	return updated;
+}
+/** Reflect written edits into the catalogue so the grid/info update this session
+*  and survive a reload. Each record is rebuilt from the store as it is now, so
+*  a rating, flag or keyword changed while the files were written stays. */
+async function updateCatalog(written, edits) {
+	if (written.length === 0) return;
+	const store = api.stores.useCatalogStore.getState();
+	const byId = new Map(written.map((w) => [w.id, w]));
+	const updated = [];
+	for (const p of store.photos) {
+		const w = byId.get(p.id);
+		if (w) updated.push(withEdits(p, edits, w.dateStr));
+	}
+	try {
+		await store.relocatePhotos(updated);
+	} catch (e) {
+		for (const w of written) {
+			w.result.ok = false;
+			w.result.reason = e instanceof Error ? e.message : "Catalogue update failed";
+		}
+	}
 }
 /** Apply `edits` + `dateOp` to each photo, returning a per-photo result. */
 async function applyMetadata(targets, edits, dateOp, onProgress) {
 	const results = [];
+	let pending = [];
 	let done = 0;
 	for (const photo of targets) {
 		onProgress?.({
@@ -1747,6 +1895,17 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 			current: photo.filename
 		});
 		const dateStr = resolveDate(dateOp, photo);
+		if (photo.copyOf) {
+			results.push({
+				id: photo.id,
+				name: photo.filename,
+				ok: false,
+				mode: "sidecar",
+				reason: "Virtual copy (edit the original)"
+			});
+			done++;
+			continue;
+		}
 		if (!hasAnyEdit(edits, dateStr)) {
 			results.push({
 				id: photo.id,
@@ -1786,14 +1945,23 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 					await writeSidecar(photo, edits, dateStr);
 				}
 			} else await writeSidecar(photo, edits, dateStr);
-			await updateCatalog(photo, edits, dateStr);
-			results.push({
+			const result = {
 				id: photo.id,
 				name: photo.filename,
 				ok: true,
 				mode,
 				reason
+			};
+			results.push(result);
+			pending.push({
+				id: photo.id,
+				dateStr,
+				result
 			});
+			if (pending.length >= CATALOG_BATCH) {
+				await updateCatalog(pending, edits);
+				pending = [];
+			}
 		} catch (e) {
 			results.push({
 				id: photo.id,
@@ -1805,6 +1973,7 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 		}
 		done++;
 	}
+	await updateCatalog(pending, edits);
 	onProgress?.({
 		done,
 		total: targets.length,
@@ -1816,12 +1985,18 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 *  the app shows those edits after a rescan. */
 async function readSidecarForImport(ctx) {
 	try {
-		const data = readXmp(await (await (await ctx.dir.getFileHandle(`${ctx.fileName}.xmp`)).getFile()).text());
+		const text = await sidecarText(ctx.dir, sidecarName(ctx.fileName)) ?? await sidecarText(ctx.dir, legacySidecarName(ctx.fileName));
+		if (text === null) return;
+		const data = readXmp(text);
 		const exif = { ...ctx.photo.exif };
 		if (data.meta.artist) exif.artist = data.meta.artist;
 		if (data.meta.copyright) exif.copyright = data.meta.copyright;
 		if (data.meta.description) exif.imageDescription = data.meta.description;
 		if (data.date) exif.dateTimeOriginal = data.date;
+		if (data.meta.gpsLat !== void 0 && data.meta.gpsLon !== void 0) {
+			exif.gpsLatitude = data.meta.gpsLat;
+			exif.gpsLongitude = data.meta.gpsLon;
+		}
 		const patch = { exif };
 		if (data.meta.keywords?.length) patch.keywords = [.../* @__PURE__ */ new Set([...ctx.photo.keywords ?? [], ...data.meta.keywords])];
 		return patch;
@@ -1989,7 +2164,7 @@ function MetadataTab() {
 		placeholder: single ? "" : "(leave unchanged)"
 	})), /* @__PURE__ */ React.createElement(Field, {
 		label: "Keywords",
-		hint: "Comma-separated"
+		hint: "Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files."
 	}, /* @__PURE__ */ React.createElement(TextArea, {
 		value: keywords,
 		onChange: (v) => {

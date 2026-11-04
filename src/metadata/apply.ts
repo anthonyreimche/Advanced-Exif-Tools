@@ -26,7 +26,7 @@ const GPS_LONREF = 0x0003;
 const GPS_LON = 0x0004;
 const EXIF_MAKERNOTE = 0x927c;
 
-/** Catalog records stored per relocatePhotos call. */
+/** Catalogue records stored per relocatePhotos call. */
 const CATALOG_BATCH = 200;
 
 export type WriteMode = "in-place" | "sidecar";
@@ -56,7 +56,7 @@ function hasAnyEdit(edits: EditableMeta, dateStr: string | null): boolean {
 }
 
 /** Mutate a parsed TIFF with the requested edits (excluding keywords, which
- *  have no native EXIF tag and ride along in the catalog / sidecar). */
+ *  have no native EXIF tag and ride along in the catalogue / sidecar). */
 function applyEditsToTiff(tiff: Tiff, edits: EditableMeta, dateStr: string | null): void {
   if (edits.artist !== undefined) setAscii(tiff.ifd0, IFD0_ARTIST, edits.artist || undefined);
   if (edits.copyright !== undefined) setAscii(tiff.ifd0, IFD0_COPYRIGHT, edits.copyright || undefined);
@@ -245,7 +245,7 @@ interface Written {
   result: WriteResult;
 }
 
-/** Reflect written edits into the catalog so the grid/info update this session
+/** Reflect written edits into the catalogue so the grid/info update this session
  *  and survive a reload. Each record is rebuilt from the store as it is now, so
  *  a rating, flag or keyword changed while the files were written stays. */
 async function updateCatalog(written: Written[], edits: EditableMeta): Promise<void> {
@@ -262,7 +262,7 @@ async function updateCatalog(written: Written[], edits: EditableMeta): Promise<v
   } catch (e) {
     for (const w of written) {
       w.result.ok = false;
-      w.result.reason = e instanceof Error ? e.message : "Catalog update failed";
+      w.result.reason = e instanceof Error ? e.message : "Catalogue update failed";
     }
   }
 }

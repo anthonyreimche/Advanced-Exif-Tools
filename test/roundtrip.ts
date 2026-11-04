@@ -121,7 +121,7 @@ function testXmp(): void {
   ok("no duplicate creator", (updated.match(/<dc:creator>/g) ?? []).length === 1);
 
   // GPS round-trips through the packet (regression: it used to be write-only,
-  // so a rescan silently dropped coordinates from the catalog).
+  // so a rescan silently dropped coordinates from the catalogue).
   const withGps = upsertXmp(null, { meta: { gpsLat: 49.5, gpsLon: -123.25 } });
   const gps = readXmp(withGps).meta;
   ok("gps latitude round-trips", Math.abs((gps.gpsLat ?? NaN) - 49.5) < 1e-4);
@@ -568,7 +568,7 @@ async function testInPlaceJpegSafety(): Promise<void> {
 }
 
 async function testCatalogMerge(): Promise<void> {
-  console.log("Catalog update:");
+  console.log("Catalogue update:");
   let fake: ReturnType<typeof installFakeApi> | null = null;
   const file = fakeFile(writeExifIntoJpeg(BARE_JPEG, cameraTiff(false)), () => {
     if (fake) fake.state.photos = fake.state.photos.map((p) => (p.id === "r1" ? { ...p, rating: 5 } : p));
@@ -586,7 +586,7 @@ async function testCatalogMerge(): Promise<void> {
   const batch = installFakeApi(many);
   await applyMetadata(many, { copyright: "C" }, { kind: "none" });
   ok(
-    "catalog updates are batched",
+    "catalogue updates are batched",
     batch.relocateSizes.length === 3 && Math.max(...batch.relocateSizes) <= 200,
     `${batch.relocateSizes.length} calls`,
   );

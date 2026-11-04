@@ -5,7 +5,7 @@
 
 import type { ComponentType, CSSProperties, ReactNode } from "react";
 
-// ── catalog model ────────────────────────────────────────────────────────────
+// ── catalogue model ────────────────────────────────────────────────────────────
 
 export type ColorLabel = "none" | "red" | "yellow" | "green" | "blue" | "purple";
 export type FlagStatus = "none" | "pick" | "reject";

@@ -60,7 +60,7 @@ thumbnail tag, not just the handful the Info panel shows).
   naming migrate automatically on the next edit; foreign sidecars using that
   naming (darktable's, for example) are read but never deleted.
 
-Keywords are stored in the catalog for every format (and in the sidecar for
+Keywords are stored in the catalogue for every format (and in the sidecar for
 RAW); the other fields are written into the file's EXIF for JPEG/TIFF.
 
 ## Install

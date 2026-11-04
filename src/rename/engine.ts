@@ -121,7 +121,7 @@ function seqLetter(index: number): string {
   return out;
 }
 
-/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalog's
+/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalogue's
  *  dateCreated. Returns null when neither is usable (date tokens → ""). */
 function captureDate(photo: CatalogPhoto): Date | null {
   const raw = photo.exif.dateTimeOriginal;
