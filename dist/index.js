@@ -334,6 +334,20 @@ function renderTemplate(photo, index, opts, subsecById) {
 	else if (opts.caseMode === "upper") base = base.toUpperCase();
 	return base;
 }
+/** Resolve the rename tokens in free text (a caption, a headline) for one photo
+*  of a batch. Unlike renderTemplate, values are not made filename-safe and an
+*  unknown {token} is kept as typed, so ordinary braces survive. {subsec} reads
+*  nothing here and resolves to "". */
+function expandTokens(text, photo, index) {
+	const ctx = {
+		photo,
+		index,
+		opts: DEFAULT_OPTIONS
+	};
+	return text.replace(TOKEN_RE, (all, rawName, arg) => {
+		return resolveToken(rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase(), arg, ctx) ?? all;
+	});
+}
 /** Whether the template resolves {subsec} — the tab only harvests EXIF
 *  subseconds from files when it does. */
 function templateUsesSubsec(template) {
@@ -1363,6 +1377,21 @@ function RenameTab() {
 
 //#endregion
 //#region src/metadata/model.ts
+/** `edits` for one photo of a batch: {tokens} in its text fields resolved for
+*  `photo` at position `index`. Keywords and copyright status stay literal. */
+function expandEdits(edits, photo, index) {
+	const expand = (s) => s === void 0 ? void 0 : expandTokens(s, photo, index);
+	const out = { ...edits };
+	if (edits.artist !== void 0) out.artist = expand(edits.artist);
+	if (edits.copyright !== void 0) out.copyright = expand(edits.copyright);
+	if (edits.description !== void 0) out.description = expand(edits.description);
+	if (edits.iptc) {
+		const iptc = {};
+		for (const [key, value] of Object.entries(edits.iptc)) iptc[key] = key === "copyrightStatus" ? value : expandTokens(value, photo, index);
+		out.iptc = iptc;
+	}
+	return out;
+}
 const pad2 = (n) => n < 10 ? "0" + n : String(n);
 /** Format a Date as EXIF "YYYY:MM:DD HH:MM:SS" in local time. */
 function formatExifDate(d) {
@@ -1427,16 +1456,27 @@ const EXIF_SIG = [
 	0,
 	0
 ];
-function isExifApp1(buf, payloadStart) {
-	if (payloadStart + EXIF_SIG.length > buf.length) return false;
-	return EXIF_SIG.every((b, i) => buf[payloadStart + i] === b);
+const XMP_SIG = ascii("http://ns.adobe.com/xap/1.0/\0");
+const PHOTOSHOP_SIG = ascii("Photoshop 3.0\0");
+const IRB_SIG = ascii("8BIM");
+const IRB_IPTC = 1028;
+function ascii(s) {
+	return [...s].map((c) => c.charCodeAt(0));
 }
-function parse(buf) {
+function startsWith(buf, at, sig) {
+	if (at + sig.length > buf.length) return false;
+	return sig.every((b, i) => buf[at + i] === b);
+}
+/** The segments before the scan. With `lenient`, a segment running past the
+*  end of `buf` (a head-of-file read) ends the walk instead of failing it. */
+function parse(buf, lenient = false) {
 	if (buf.length < 2 || buf[0] !== 255 || buf[1] !== 216) return null;
 	const segments = [{
 		marker: 216,
 		raw: buf.subarray(0, 2),
-		isExif: false
+		isExif: false,
+		isXmp: false,
+		isPhotoshop: false
 	}];
 	let off = 2;
 	while (off + 4 <= buf.length) {
@@ -1445,12 +1485,17 @@ function parse(buf) {
 		if (marker === 218 || marker === 217) break;
 		const len = buf[off + 2] << 8 | buf[off + 3];
 		const end = off + 2 + len;
-		if (end > buf.length) return null;
+		if (end > buf.length) {
+			if (lenient) break;
+			return null;
+		}
 		const payloadStart = off + 4;
 		segments.push({
 			marker,
 			raw: buf.subarray(off, end),
-			isExif: marker === 225 && isExifApp1(buf, payloadStart)
+			isExif: marker === 225 && startsWith(buf, payloadStart, EXIF_SIG),
+			isXmp: marker === 225 && startsWith(buf, payloadStart, XMP_SIG),
+			isPhotoshop: marker === 237 && startsWith(buf, payloadStart, PHOTOSHOP_SIG)
 		});
 		off = end;
 	}
@@ -1499,14 +1544,407 @@ function writeExifIntoJpeg(buf, tiff) {
 	}
 	return out;
 }
+function segment(marker, payload) {
+	const segLen = payload.length + 2;
+	if (segLen > MAX_APP1) throw new Error("Metadata exceeds the 64 KB JPEG segment limit.");
+	const out = new Uint8Array(2 + segLen);
+	out[0] = 255;
+	out[1] = marker;
+	out[2] = segLen >> 8 & 255;
+	out[3] = segLen & 255;
+	out.set(payload, 4);
+	return out;
+}
+function concat(chunks) {
+	const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+	let p = 0;
+	for (const c of chunks) {
+		out.set(c, p);
+		p += c.length;
+	}
+	return out;
+}
+/** A Photoshop image resource block holding `iim` as its IPTC resource: the
+*  signature, the resource id, an empty Pascal name padded to even length, the
+*  size, then the data padded to even length. */
+function iptcResource(iim) {
+	return concat([
+		IRB_SIG,
+		[
+			4,
+			4,
+			0,
+			0
+		],
+		[
+			iim.length >>> 24 & 255,
+			iim.length >>> 16 & 255,
+			iim.length >>> 8 & 255,
+			iim.length & 255
+		],
+		iim,
+		iim.length & 1 ? [0] : []
+	]);
+}
+/** `buf` with its XMP and Photoshop segments replaced by `xmp` and `iim`
+*  (either may be empty, for none), placed after the JFIF/EXIF segments. Every
+*  other segment and the scan are kept byte for byte. Throws when the JPEG
+*  can't be parsed or a block is too big for one segment. */
+function embedIptcInJpeg(buf, xmp, iim) {
+	const parts = parse(buf);
+	if (!parts) throw new Error("Not a parseable JPEG.");
+	const added = [];
+	if (xmp) added.push(segment(225, concat([XMP_SIG, new TextEncoder().encode(xmp)])));
+	if (iim.length) added.push(segment(237, concat([PHOTOSHOP_SIG, iptcResource(iim)])));
+	const kept = parts.segments.filter((s) => !s.isXmp && !s.isPhotoshop);
+	let at = 1;
+	while (at < kept.length && (kept[at].marker === 224 || kept[at].isExif)) at++;
+	return concat([
+		...kept.slice(0, at).map((s) => s.raw),
+		...added,
+		...kept.slice(at).map((s) => s.raw),
+		parts.rest
+	]);
+}
+/** The IPTC resource's bytes inside a Photoshop APP13 payload, or null. */
+function iimFromPhotoshop(payload) {
+	const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+	let off = PHOTOSHOP_SIG.length;
+	while (off + 12 <= payload.length && startsWith(payload, off, IRB_SIG)) {
+		const id = dv.getUint16(off + 4, false);
+		const nameLen = payload[off + 6];
+		const sizeAt = off + 6 + (nameLen + 2 & -2);
+		if (sizeAt + 4 > payload.length) return null;
+		const size = dv.getUint32(sizeAt, false);
+		const dataAt = sizeAt + 4;
+		if (dataAt + size > payload.length) return null;
+		if (id === IRB_IPTC) return payload.subarray(dataAt, dataAt + size);
+		off = dataAt + size + (size & 1);
+	}
+	return null;
+}
+/** The XMP packet and IPTC-IIM bytes embedded in a JPEG (or the head of one),
+*  each null when absent. */
+function readEmbeddedMeta(buf) {
+	const parts = parse(buf, true);
+	if (!parts) return {
+		xmp: null,
+		iim: null
+	};
+	const xmpSeg = parts.segments.find((s) => s.isXmp);
+	const psSeg = parts.segments.find((s) => s.isPhotoshop);
+	return {
+		xmp: xmpSeg ? new TextDecoder().decode(xmpSeg.raw.subarray(4 + XMP_SIG.length)) : null,
+		iim: psSeg ? iimFromPhotoshop(psSeg.raw.subarray(4)) : null
+	};
+}
+
+//#endregion
+//#region src/metadata/iptc.ts
+const IPTC_FIELDS = [
+	{
+		key: "title",
+		label: "Title",
+		group: "content",
+		xmp: "dc:title",
+		form: "alt",
+		iim: {
+			dataset: 5,
+			max: 64
+		}
+	},
+	{
+		key: "headline",
+		label: "Headline",
+		group: "content",
+		xmp: "photoshop:Headline",
+		form: "text",
+		iim: {
+			dataset: 105,
+			max: 256
+		}
+	},
+	{
+		key: "captionWriter",
+		label: "Caption writer",
+		group: "content",
+		xmp: "photoshop:CaptionWriter",
+		form: "text",
+		iim: {
+			dataset: 122,
+			max: 32
+		}
+	},
+	{
+		key: "copyrightStatus",
+		label: "Copyright status",
+		group: "rights",
+		xmp: "xmpRights:Marked",
+		form: "marked"
+	},
+	{
+		key: "usageTerms",
+		label: "Rights usage terms",
+		group: "rights",
+		xmp: "xmpRights:UsageTerms",
+		form: "alt",
+		multiline: true
+	},
+	{
+		key: "webStatement",
+		label: "Copyright info URL",
+		group: "rights",
+		xmp: "xmpRights:WebStatement",
+		form: "text"
+	},
+	{
+		key: "credit",
+		label: "Credit line",
+		group: "rights",
+		xmp: "photoshop:Credit",
+		form: "text",
+		iim: {
+			dataset: 110,
+			max: 32
+		}
+	},
+	{
+		key: "source",
+		label: "Source",
+		group: "rights",
+		xmp: "photoshop:Source",
+		form: "text",
+		iim: {
+			dataset: 115,
+			max: 32
+		}
+	},
+	{
+		key: "authorsPosition",
+		label: "Creator's job title",
+		group: "rights",
+		xmp: "photoshop:AuthorsPosition",
+		form: "text",
+		iim: {
+			dataset: 85,
+			max: 32
+		}
+	},
+	{
+		key: "sublocation",
+		label: "Sublocation",
+		group: "location",
+		xmp: "Iptc4xmpCore:Location",
+		form: "text",
+		iim: {
+			dataset: 92,
+			max: 32
+		}
+	},
+	{
+		key: "city",
+		label: "City",
+		group: "location",
+		xmp: "photoshop:City",
+		form: "text",
+		iim: {
+			dataset: 90,
+			max: 32
+		}
+	},
+	{
+		key: "state",
+		label: "Province / state",
+		group: "location",
+		xmp: "photoshop:State",
+		form: "text",
+		iim: {
+			dataset: 95,
+			max: 32
+		}
+	},
+	{
+		key: "country",
+		label: "Country",
+		group: "location",
+		xmp: "photoshop:Country",
+		form: "text",
+		iim: {
+			dataset: 101,
+			max: 64
+		}
+	},
+	{
+		key: "countryCode",
+		label: "Country code",
+		group: "location",
+		xmp: "Iptc4xmpCore:CountryCode",
+		form: "text",
+		iim: {
+			dataset: 100,
+			max: 3
+		}
+	},
+	{
+		key: "jobId",
+		label: "Job ID",
+		group: "workflow",
+		xmp: "photoshop:TransmissionReference",
+		form: "text",
+		iim: {
+			dataset: 103,
+			max: 32
+		}
+	},
+	{
+		key: "instructions",
+		label: "Instructions",
+		group: "workflow",
+		xmp: "photoshop:Instructions",
+		form: "text",
+		iim: {
+			dataset: 40,
+			max: 256
+		},
+		multiline: true
+	}
+];
+const IPTC_GROUPS = [
+	{
+		value: "content",
+		label: "Content"
+	},
+	{
+		value: "rights",
+		label: "Rights"
+	},
+	{
+		value: "location",
+		label: "Location"
+	},
+	{
+		value: "workflow",
+		label: "Workflow"
+	}
+];
+const COPYRIGHT_STATUS_OPTIONS = [
+	{
+		value: "",
+		label: "Unknown"
+	},
+	{
+		value: "copyrighted",
+		label: "Copyrighted"
+	},
+	{
+		value: "public",
+		label: "Public domain"
+	}
+];
+const TAG_MARKER = 28;
+const DS_BYLINE = 80;
+const DS_COPYRIGHT = 116;
+const DS_CAPTION = 120;
+const DS_KEYWORDS = 25;
+const DS_CHARSET = 90;
+const DS_RECORD_VERSION = 0;
+const UTF8_ESCAPE = [
+	27,
+	37,
+	71
+];
+/** UTF-8 bytes of `s`, cut to at most `max` bytes without splitting a character. */
+function utf8Limited(s, max) {
+	const bytes = new TextEncoder().encode(s);
+	if (bytes.length <= max) return bytes;
+	let end = max;
+	while (end > 0 && (bytes[end] & 192) === 128) end--;
+	return bytes.subarray(0, end);
+}
+function dataset(record, ds, value) {
+	return [
+		TAG_MARKER,
+		record,
+		ds,
+		value.length >> 8 & 255,
+		value.length & 255,
+		...value
+	];
+}
+/** IIM datasets for `meta`, UTF-8 declared, values cut to the IIM byte limits
+*  (the XMP packet keeps the full text). Empty when nothing has a value. */
+function buildIim(meta) {
+	const out = [];
+	const add = (ds, value, max) => {
+		if (value) out.push(...dataset(2, ds, utf8Limited(value, max)));
+	};
+	add(DS_BYLINE, meta.artist, 32);
+	add(DS_COPYRIGHT, meta.copyright, 128);
+	add(DS_CAPTION, meta.description, 2e3);
+	for (const k of meta.keywords ?? []) add(DS_KEYWORDS, k, 64);
+	for (const f of IPTC_FIELDS) if (f.iim) add(f.iim.dataset, meta.iptc?.[f.key], f.iim.max);
+	if (out.length === 0) return /* @__PURE__ */ new Uint8Array(0);
+	const header = [...dataset(1, DS_CHARSET, new Uint8Array(UTF8_ESCAPE)), ...dataset(2, DS_RECORD_VERSION, new Uint8Array([0, 4]))];
+	return new Uint8Array([...header, ...out]);
+}
+/** The fields buildIim writes, read back from raw IIM datasets. Values are
+*  UTF-8 when record 1 declares it, else Windows-1252 (legacy writers). */
+function parseIim(bytes) {
+	const raw = [];
+	let off = 0;
+	while (off + 5 <= bytes.length && bytes[off] === TAG_MARKER) {
+		const len = bytes[off + 3] << 8 | bytes[off + 4];
+		if (len & 32768) break;
+		const start = off + 5;
+		if (start + len > bytes.length) break;
+		raw.push({
+			record: bytes[off + 1],
+			ds: bytes[off + 2],
+			value: bytes.subarray(start, start + len)
+		});
+		off = start + len;
+	}
+	const charset = raw.find((d) => d.record === 1 && d.ds === DS_CHARSET)?.value;
+	const utf8 = !!charset && UTF8_ESCAPE.every((b, i) => charset[i] === b);
+	const decoder = new TextDecoder(utf8 ? "utf-8" : "windows-1252");
+	const text = (ds) => {
+		const d = raw.find((r) => r.record === 2 && r.ds === ds);
+		return d ? decoder.decode(d.value).trim() || void 0 : void 0;
+	};
+	const meta = {};
+	const artist = text(DS_BYLINE);
+	if (artist) meta.artist = artist;
+	const copyright = text(DS_COPYRIGHT);
+	if (copyright) meta.copyright = copyright;
+	const description = text(DS_CAPTION);
+	if (description) meta.description = description;
+	const keywords = raw.filter((r) => r.record === 2 && r.ds === DS_KEYWORDS).map((r) => decoder.decode(r.value).trim()).filter(Boolean);
+	if (keywords.length) meta.keywords = keywords;
+	const iptc = {};
+	for (const f of IPTC_FIELDS) {
+		const v = f.iim ? text(f.iim.dataset) : void 0;
+		if (v) iptc[f.key] = v;
+	}
+	if (Object.keys(iptc).length) meta.iptc = iptc;
+	return meta;
+}
 
 //#endregion
 //#region src/metadata/xmp.ts
 const NS = {
 	dc: "http://purl.org/dc/elements/1.1/",
 	exif: "http://ns.adobe.com/exif/1.0/",
-	xmp: "http://ns.adobe.com/xap/1.0/"
+	xmp: "http://ns.adobe.com/xap/1.0/",
+	photoshop: "http://ns.adobe.com/photoshop/1.0/",
+	Iptc4xmpCore: "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
+	xmpRights: "http://ns.adobe.com/xap/1.0/rights/"
 };
+/** Namespaces every fresh packet declares, used or not. */
+const BASE_PREFIXES = [
+	"dc",
+	"exif",
+	"xmp"
+];
 const XMPTK = "Advanced EXIF Tools";
 const RAW_EXT = /^(nef|cr2|cr3|crw|dng|arw|orf|raf|rw2|pef|srw|3fr|dcr|erf|kdc|mos|raw|nrw)$/i;
 /** Adobe/Lightroom sidecar convention, shared with the XMP Tools extension:
@@ -1581,42 +2019,75 @@ function managedElements(fields) {
 			xml: `<exif:GPSLongitude>${decimalToXmp(meta.gpsLon, "E", "W")}</exif:GPSLongitude>`
 		});
 	}
+	for (const f of IPTC_FIELDS) {
+		const value = meta.iptc?.[f.key];
+		if (value === void 0) continue;
+		out.push({
+			tag: f.xmp,
+			xml: value ? iptcElement(f.xmp, f.form, value) : null
+		});
+	}
 	return out;
 }
-function freshPacket(inner) {
-	return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="${XMPTK}">\n <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n  <rdf:Description rdf:about=""\n    xmlns:dc="${NS.dc}"\n    xmlns:exif="${NS.exif}"\n    xmlns:xmp="${NS.xmp}">\n   ${inner}\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>`;
+function iptcElement(tag, form, value) {
+	if (form === "alt") return `<${tag}><rdf:Alt><rdf:li xml:lang="x-default">${esc(value)}</rdf:li></rdf:Alt></${tag}>`;
+	if (form === "marked") return `<${tag}>${value === "public" ? "False" : "True"}</${tag}>`;
+	return `<${tag}>${esc(value)}</${tag}>`;
+}
+/** The known namespace prefixes the serialized elements use. */
+function prefixesIn(elements) {
+	const used = /* @__PURE__ */ new Set();
+	for (const el of elements) for (const m of el.matchAll(/<([A-Za-z][\w-]*):/g)) if (NS[m[1]]) used.add(m[1]);
+	return [...used];
+}
+function freshPacket(inner, used) {
+	return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="${XMPTK}">\n <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n  <rdf:Description rdf:about=""\n${[...BASE_PREFIXES, ...used.filter((p) => !BASE_PREFIXES.includes(p))].map((p) => `    xmlns:${p}="${NS[p]}"`).join("\n")}>\n   ${inner}\n  </rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n<?xpacket end="w"?>`;
 }
 /** Produce updated XMP text carrying `fields`, preserving foreign properties in
 *  an existing packet. */
 function upsertXmp(existing, fields) {
 	const managed = managedElements(fields);
 	const additions = managed.filter((m) => m.xml).map((m) => m.xml);
-	if (!existing || !/<rdf:Description[\s>]/.test(existing)) return freshPacket(additions.join("\n   "));
+	if (!existing || !/<rdf:Description[\s>]/.test(existing)) return freshPacket(additions.join("\n   "), prefixesIn(additions));
 	let text = existing;
 	text = text.replace(/<rdf:Description\b([^>]*?)\/\s*>/, "<rdf:Description$1></rdf:Description>");
 	for (const m of managed) {
-		const re = new RegExp(`\\s*<${m.tag}[\\s\\S]*?<\\/${m.tag}>`, "g");
-		text = text.replace(re, "");
-		text = text.replace(new RegExp(`\\s*<${m.tag}\\b[^>]*/>`, "g"), "");
+		text = text.replace(new RegExp(`\\s*<${m.tag}(?=[\\s>])[\\s\\S]*?<\\/${m.tag}>`, "g"), "");
+		text = text.replace(new RegExp(`\\s*<${m.tag}(?=[\\s/])[^>]*/>`, "g"), "");
 		text = text.replace(new RegExp(`\\s+${m.tag}="[^"]*"`, "g"), "");
 	}
+	const used = prefixesIn(additions);
 	text = text.replace(/<rdf:Description\b([^>]*)>/, (_full, attrs) => {
 		let a = attrs;
 		if (!/xmlns:dc=/.test(a)) a += ` xmlns:dc="${NS.dc}"`;
-		if (!/xmlns:exif=/.test(a) && additions.some((x) => x.includes("exif:"))) a += ` xmlns:exif="${NS.exif}"`;
+		for (const p of used) if (!a.includes(`xmlns:${p}=`)) a += ` xmlns:${p}="${NS[p]}"`;
 		return `<rdf:Description${a}>`;
 	});
 	const insertion = additions.length ? `   ${additions.join("\n   ")}\n  ` : "";
 	return text.replace(/<\/rdf:Description>/, () => `${insertion}</rdf:Description>`);
 }
-function firstAltOrSeq(xmp, tag) {
-	const block = new RegExp(`<${tag}[\\s\\S]*?>([\\s\\S]*?)</${tag}>`).exec(xmp);
+/** A property's value: the first rdf:li of an Alt/Seq/Bag, the element's own
+*  text, or the attribute form. Undefined when absent or empty. */
+function readProp(xmp, tag) {
+	const block = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`).exec(xmp);
 	if (block) {
 		const li = /<rdf:li(?:\s[^>]*)?>([\s\S]*?)<\/rdf:li>/.exec(block[1]);
-		if (li) return unesc(li[1].trim());
+		const v = unesc((li ? li[1] : block[1].includes("<") ? "" : block[1]).trim());
+		if (v) return v;
 	}
 	const attr = new RegExp(`\\s${tag}="([^"]*)"`).exec(xmp);
-	return attr ? unesc(attr[1].trim()) : void 0;
+	return attr && unesc(attr[1].trim()) || void 0;
+}
+function readIptcProps(xmp) {
+	const out = {};
+	for (const f of IPTC_FIELDS) {
+		const v = readProp(xmp, f.xmp);
+		if (!v) continue;
+		if (f.form !== "marked") out[f.key] = v;
+		else if (/^true$/i.test(v)) out[f.key] = "copyrighted";
+		else if (/^false$/i.test(v)) out[f.key] = "public";
+	}
+	return out;
 }
 function bagItems(xmp, tag) {
 	const block = new RegExp(`<${tag}[\\s\\S]*?>([\\s\\S]*?)</${tag}>`).exec(xmp);
@@ -1640,12 +2111,14 @@ function xmpGpsToDecimal(value) {
 /** Parse the fields we manage out of an XMP sidecar's text. */
 function readXmp(text) {
 	const meta = {};
-	const creator = firstAltOrSeq(text, "dc:creator");
+	const creator = readProp(text, "dc:creator");
 	if (creator) meta.artist = creator;
-	const rights = firstAltOrSeq(text, "dc:rights");
+	const rights = readProp(text, "dc:rights");
 	if (rights) meta.copyright = rights;
-	const desc = firstAltOrSeq(text, "dc:description");
+	const desc = readProp(text, "dc:description");
 	if (desc) meta.description = desc;
+	const iptc = readIptcProps(text);
+	if (Object.keys(iptc).length) meta.iptc = iptc;
 	const kws = bagItems(text, "dc:subject");
 	if (kws.length) meta.keywords = kws;
 	const coord = (tag) => {
@@ -1687,7 +2160,11 @@ function extOf(filename) {
 	const i = filename.lastIndexOf(".");
 	return i >= 0 ? filename.slice(i + 1).toLowerCase() : "";
 }
-function hasAnyEdit(edits, dateStr) {
+function hasIptcEdit(edits) {
+	return !!edits.iptc && Object.keys(edits.iptc).length > 0;
+}
+/** Whether anything outside the IPTC sidecar fields changes. */
+function hasFileEdit(edits, dateStr) {
 	return dateStr != null || edits.artist !== void 0 || edits.copyright !== void 0 || edits.description !== void 0 || edits.keywords !== void 0 || edits.gpsLat !== void 0 && edits.gpsLon !== void 0;
 }
 /** Mutate a parsed TIFF with the requested edits (excluding keywords, which
@@ -1865,14 +2342,14 @@ function withEdits(current, edits, dateStr) {
 /** Reflect written edits into the catalogue so the grid/info update this session
 *  and survive a reload. Each record is rebuilt from the store as it is now, so
 *  a rating, flag or keyword changed while the files were written stays. */
-async function updateCatalog(written, edits) {
+async function updateCatalog(written) {
 	if (written.length === 0) return;
 	const store = api.stores.useCatalogStore.getState();
 	const byId = new Map(written.map((w) => [w.id, w]));
 	const updated = [];
 	for (const p of store.photos) {
 		const w = byId.get(p.id);
-		if (w) updated.push(withEdits(p, edits, w.dateStr));
+		if (w) updated.push(withEdits(p, w.edits, w.dateStr));
 	}
 	try {
 		await store.relocatePhotos(updated);
@@ -1883,18 +2360,23 @@ async function updateCatalog(written, edits) {
 		}
 	}
 }
-/** Apply `edits` + `dateOp` to each photo, returning a per-photo result. */
+/** Apply `edits` + `dateOp` to each photo, returning a per-photo result. Text
+*  fields' {tokens} resolve per photo, by its position in `targets`. IPTC
+*  fields always go to the XMP sidecar, so an IPTC-only edit never rewrites a
+*  JPEG or TIFF. */
 async function applyMetadata(targets, edits, dateOp, onProgress) {
 	const results = [];
 	let pending = [];
 	let done = 0;
-	for (const photo of targets) {
+	for (const [index, photo] of targets.entries()) {
 		onProgress?.({
 			done,
 			total: targets.length,
 			current: photo.filename
 		});
 		const dateStr = resolveDate(dateOp, photo);
+		const own = expandEdits(edits, photo, index);
+		const fileEdit = hasFileEdit(own, dateStr);
 		if (photo.copyOf) {
 			results.push({
 				id: photo.id,
@@ -1906,7 +2388,7 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 			done++;
 			continue;
 		}
-		if (!hasAnyEdit(edits, dateStr)) {
+		if (!fileEdit && !hasIptcEdit(own)) {
 			results.push({
 				id: photo.id,
 				name: photo.filename,
@@ -1929,22 +2411,28 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 			continue;
 		}
 		const ext = extOf(photo.filename);
-		const inPlace = ext === "jpg" || ext === "jpeg" || ext === "tif" || ext === "tiff";
+		const inPlace = fileEdit && !!photo.fileHandle && [
+			"jpg",
+			"jpeg",
+			"tif",
+			"tiff"
+		].includes(ext);
 		let mode = inPlace ? "in-place" : "sidecar";
 		let reason;
 		try {
+			let wroteFile = false;
 			if (inPlace && photo.fileHandle) {
 				const buf = new Uint8Array(await (await photo.fileHandle.getFile()).arrayBuffer());
-				let out;
 				try {
-					out = ext === "jpg" || ext === "jpeg" ? editJpeg(buf, edits, dateStr) : editTiff(buf, edits, dateStr);
+					const out = ext === "jpg" || ext === "jpeg" ? editJpeg(buf, own, dateStr) : editTiff(buf, own, dateStr);
 					await writeBytes(photo.fileHandle, out);
+					wroteFile = true;
 				} catch (e) {
 					mode = "sidecar";
 					reason = e instanceof Error ? `In-place unavailable: ${e.message} — wrote sidecar` : "Wrote sidecar";
-					await writeSidecar(photo, edits, dateStr);
+					await writeSidecar(photo, own, dateStr);
 				}
-			} else await writeSidecar(photo, edits, dateStr);
+			} else await writeSidecar(photo, own, dateStr);
 			const result = {
 				id: photo.id,
 				name: photo.filename,
@@ -1952,14 +2440,21 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 				mode,
 				reason
 			};
+			if (wroteFile && hasIptcEdit(own)) try {
+				await writeSidecar(photo, { iptc: own.iptc }, null);
+			} catch (e) {
+				result.ok = false;
+				result.reason = `EXIF written, but the IPTC sidecar failed: ${e instanceof Error ? e.message : String(e)}`;
+			}
 			results.push(result);
 			pending.push({
 				id: photo.id,
+				edits: own,
 				dateStr,
 				result
 			});
 			if (pending.length >= CATALOG_BATCH) {
-				await updateCatalog(pending, edits);
+				await updateCatalog(pending);
 				pending = [];
 			}
 		} catch (e) {
@@ -1973,7 +2468,7 @@ async function applyMetadata(targets, edits, dateOp, onProgress) {
 		}
 		done++;
 	}
-	await updateCatalog(pending, edits);
+	await updateCatalog(pending);
 	onProgress?.({
 		done,
 		total: targets.length,
@@ -2004,9 +2499,42 @@ async function readSidecarForImport(ctx) {
 		return;
 	}
 }
+const HEAD_BYTES = 1 << 20;
+/** The photo's IPTC fields: its XMP sidecar first, then, for a JPEG, the XMP
+*  and IPTC-IIM embedded in the file (a caption written by another app).
+*  Throws when the sidecar exists but can't be read. */
+async function readIptc(photo) {
+	let embedded = {};
+	const ext = extOf(photo.filename);
+	if ((ext === "jpg" || ext === "jpeg") && photo.fileHandle) try {
+		const file = await photo.fileHandle.getFile();
+		const head = file.size > HEAD_BYTES ? file.slice(0, HEAD_BYTES) : file;
+		const found = readEmbeddedMeta(new Uint8Array(await head.arrayBuffer()));
+		embedded = {
+			...found.iim ? parseIim(found.iim).iptc : {},
+			...found.xmp ? readXmp(found.xmp).meta.iptc : {}
+		};
+	} catch {}
+	const dir = photo.directoryHandle;
+	const text = dir ? await sidecarText(dir, sidecarName(photo.filename)) ?? await sidecarText(dir, legacySidecarName(photo.filename)) : null;
+	return {
+		...embedded,
+		...text ? readXmp(text).meta.iptc : {}
+	};
+}
 
 //#endregion
-//#region src/metadata/MetadataTab.tsx
+//#region src/metadata/form.ts
+const BASE_KEYS = [
+	"artist",
+	"copyright",
+	"description",
+	"keywords"
+];
+const FORM_KEYS = [...BASE_KEYS, ...IPTC_FIELDS.map((f) => f.key)];
+function emptyForm() {
+	return Object.fromEntries(FORM_KEYS.map((k) => [k, ""]));
+}
 function parseKeywords(s) {
 	const seen = /* @__PURE__ */ new Set();
 	for (const raw of s.split(/[,\n]/)) {
@@ -2015,6 +2543,59 @@ function parseKeywords(s) {
 	}
 	return [...seen];
 }
+/** The touched fields as edits; a touched empty field clears its tag. */
+function formToEdits(values, touched) {
+	const edits = {};
+	if (touched.artist) edits.artist = values.artist;
+	if (touched.copyright) edits.copyright = values.copyright;
+	if (touched.description) edits.description = values.description;
+	if (touched.keywords) edits.keywords = parseKeywords(values.keywords);
+	const iptc = {};
+	for (const f of IPTC_FIELDS) if (touched[f.key]) iptc[f.key] = values[f.key];
+	if (Object.keys(iptc).length) edits.iptc = iptc;
+	return edits;
+}
+/** A template of every field that has a value. */
+function templateFromForm(name, values) {
+	const kept = {};
+	for (const k of FORM_KEYS) {
+		const v = values[k];
+		if (v && v.trim()) kept[k] = v;
+	}
+	return {
+		name: name.trim(),
+		values: kept
+	};
+}
+/** The form with the template's fields filled in and marked touched; the
+*  fields it doesn't carry keep their value and state. */
+function applyTemplate(values, touched, template) {
+	const nextValues = { ...values };
+	const nextTouched = { ...touched };
+	for (const k of FORM_KEYS) {
+		const v = template.values[k];
+		if (v === void 0) continue;
+		nextValues[k] = v;
+		nextTouched[k] = true;
+	}
+	return {
+		values: nextValues,
+		touched: nextTouched
+	};
+}
+const sameName = (a, b) => a.localeCompare(b, void 0, { sensitivity: "accent" }) === 0;
+/** `list` with `template` added, replacing one of the same name in any case,
+*  sorted by name. */
+function upsertTemplate(list, template) {
+	return [...list.filter((t) => !sameName(t.name, template.name)), template].sort((a, b) => a.name.localeCompare(b.name, void 0, { sensitivity: "base" }));
+}
+function removeTemplate(list, name) {
+	return list.filter((t) => !sameName(t.name, name));
+}
+
+//#endregion
+//#region src/metadata/MetadataTab.tsx
+const TEMPLATES_KEY = "metadata.templates";
 /** Accept EXIF, ISO, or datetime-local forms → EXIF "YYYY:MM:DD HH:MM:SS". */
 function toExifDate(s) {
 	const m = s.match(/(\d{4})\D(\d{1,2})\D(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
@@ -2024,15 +2605,16 @@ function toExifDate(s) {
 }
 const READ_LIMIT = 1 << 20;
 function MetadataTab() {
-	const { Button, TextInput, TextArea, NumberInput, SegmentedControl, Section, Field, Row, Stack, ProgressBar, Toggle, tokens } = ui;
+	const { Button, TextInput, TextArea, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, Toggle, tokens } = ui;
 	const targets = useSelectedPhotos();
 	const single = targets.length === 1;
 	const firstId = targets[0]?.id;
-	const [artist, setArtist] = React.useState("");
-	const [copyright, setCopyright] = React.useState("");
-	const [description, setDescription] = React.useState("");
-	const [keywords, setKeywords] = React.useState("");
+	const [values, setValues] = React.useState(emptyForm);
 	const [touched, setTouched] = React.useState({});
+	const touchedRef = React.useRef(touched);
+	touchedRef.current = touched;
+	const [group, setGroup] = React.useState("content");
+	const [iptcErr, setIptcErr] = React.useState(null);
 	const [dateMode, setDateMode] = React.useState("none");
 	const [dateSet, setDateSet] = React.useState("");
 	const [shiftH, setShiftH] = React.useState(0);
@@ -2040,37 +2622,60 @@ function MetadataTab() {
 	const [gpsOn, setGpsOn] = React.useState(false);
 	const [lat, setLat] = React.useState(0);
 	const [lon, setLon] = React.useState(0);
+	const [templates, setTemplates] = React.useState(() => api.settings.get(TEMPLATES_KEY, []));
+	const [templateName, setTemplateName] = React.useState("");
 	const [applying, setApplying] = React.useState(false);
 	const [prog, setProg] = React.useState(null);
 	const [results, setResults] = React.useState(null);
-	const mark = (k) => setTouched((t) => t[k] ? t : {
-		...t,
-		[k]: true
-	});
+	const setField = (k, v) => {
+		setValues((prev) => ({
+			...prev,
+			[k]: v
+		}));
+		setTouched((t) => t[k] ? t : {
+			...t,
+			[k]: true
+		});
+	};
 	React.useEffect(() => {
+		let cancelled = false;
 		setTouched({});
 		setResults(null);
+		setIptcErr(null);
 		setDateMode("none");
 		setGpsOn(false);
 		const p = targets[0];
 		if (single && p) {
 			const m = currentMeta(p);
-			setArtist(m.artist ?? "");
-			setCopyright(m.copyright ?? "");
-			setDescription(m.description ?? "");
-			setKeywords((m.keywords ?? []).join(", "));
+			setValues({
+				...emptyForm(),
+				artist: m.artist ?? "",
+				copyright: m.copyright ?? "",
+				description: m.description ?? "",
+				keywords: (m.keywords ?? []).join(", ")
+			});
 			setDateSet(p.exif.dateTimeOriginal ?? "");
 			setLat(m.gpsLat ?? 0);
 			setLon(m.gpsLon ?? 0);
+			readIptc(p).then((iptc) => {
+				if (cancelled) return;
+				setValues((prev) => {
+					const next = { ...prev };
+					for (const f of IPTC_FIELDS) if (!touchedRef.current[f.key]) next[f.key] = iptc[f.key] ?? "";
+					return next;
+				});
+			}, (e) => {
+				if (!cancelled) setIptcErr(e instanceof Error ? e.message : String(e));
+			});
 		} else {
-			setArtist("");
-			setCopyright("");
-			setDescription("");
-			setKeywords("");
+			setValues(emptyForm());
 			setDateSet("");
 			setLat(0);
 			setLon(0);
 		}
+		return () => {
+			cancelled = true;
+		};
 	}, [firstId, targets.length]);
 	const [dump, setDump] = React.useState(null);
 	const [dumpErr, setDumpErr] = React.useState(null);
@@ -2093,12 +2698,29 @@ function MetadataTab() {
 			cancelled = true;
 		};
 	}, [firstId]);
+	const storeTemplates = (next) => {
+		setTemplates(next);
+		api.settings.set(TEMPLATES_KEY, next);
+	};
+	const savedTemplate = templates.find((t) => t.name.toLowerCase() === templateName.trim().toLowerCase());
+	const saveTemplate = () => {
+		const tpl = templateFromForm(templateName, values);
+		if (tpl.name) storeTemplates(upsertTemplate(templates, tpl));
+	};
+	const deleteTemplate = () => {
+		storeTemplates(removeTemplate(templates, templateName.trim()));
+		setTemplateName("");
+	};
+	const loadTemplate = (name) => {
+		const tpl = templates.find((t) => t.name === name);
+		if (!tpl) return;
+		const next = applyTemplate(values, touched, tpl);
+		setValues(next.values);
+		setTouched(next.touched);
+		setTemplateName(name);
+	};
 	const buildEdits = () => {
-		const edits = {};
-		if (touched.artist) edits.artist = artist;
-		if (touched.copyright) edits.copyright = copyright;
-		if (touched.description) edits.description = description;
-		if (touched.keywords) edits.keywords = parseKeywords(keywords);
+		const edits = formToEdits(values, touched);
 		if (gpsOn) {
 			edits.gpsLat = lat;
 			edits.gpsLon = lon;
@@ -2140,40 +2762,66 @@ function MetadataTab() {
 	const inPlace = results?.filter((r) => r.ok && r.mode === "in-place").length ?? 0;
 	const sidecar = results?.filter((r) => r.ok && r.mode === "sidecar").length ?? 0;
 	const failed = results?.filter((r) => !r.ok) ?? [];
+	const keep = single ? "" : "(leave unchanged)";
+	const iptcInput = (f) => {
+		if (f.form === "marked") {
+			const options = keep && !touched[f.key] ? COPYRIGHT_STATUS_OPTIONS.map((o) => o.value ? o : {
+				...o,
+				label: keep
+			}) : COPYRIGHT_STATUS_OPTIONS;
+			return /* @__PURE__ */ React.createElement(Select, {
+				value: values[f.key],
+				onChange: (v) => setField(f.key, v),
+				options
+			});
+		}
+		return f.multiline ? /* @__PURE__ */ React.createElement(TextArea, {
+			value: values[f.key],
+			onChange: (v) => setField(f.key, v),
+			rows: 2,
+			placeholder: keep
+		}) : /* @__PURE__ */ React.createElement(TextInput, {
+			value: values[f.key],
+			onChange: (v) => setField(f.key, v),
+			placeholder: keep
+		});
+	};
+	const groupTouched = (g) => IPTC_FIELDS.some((f) => f.group === g && touched[f.key]);
 	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: targets.length > 1 ? `Edit metadata (${targets.length} photos)` : "Edit metadata" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Select one or more photos in the grid."), targets.length > 1 && /* @__PURE__ */ React.createElement(Hint, null, "Only the fields you change are written. Empty a field to clear it."), /* @__PURE__ */ React.createElement(Field, { label: "Creator" }, /* @__PURE__ */ React.createElement(TextInput, {
-		value: artist,
-		onChange: (v) => {
-			setArtist(v);
-			mark("artist");
-		},
-		placeholder: single ? "" : "(leave unchanged)"
+		value: values.artist,
+		onChange: (v) => setField("artist", v),
+		placeholder: keep
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Copyright" }, /* @__PURE__ */ React.createElement(TextInput, {
-		value: copyright,
-		onChange: (v) => {
-			setCopyright(v);
-			mark("copyright");
-		},
-		placeholder: single ? "" : "(leave unchanged)"
+		value: values.copyright,
+		onChange: (v) => setField("copyright", v),
+		placeholder: keep
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Caption / description" }, /* @__PURE__ */ React.createElement(TextArea, {
-		value: description,
-		onChange: (v) => {
-			setDescription(v);
-			mark("description");
-		},
+		value: values.description,
+		onChange: (v) => setField("description", v),
 		rows: 2,
-		placeholder: single ? "" : "(leave unchanged)"
+		placeholder: keep
 	})), /* @__PURE__ */ React.createElement(Field, {
 		label: "Keywords",
 		hint: "Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files."
 	}, /* @__PURE__ */ React.createElement(TextArea, {
-		value: keywords,
-		onChange: (v) => {
-			setKeywords(v);
-			mark("keywords");
-		},
+		value: values.keywords,
+		onChange: (v) => setField("keywords", v),
 		rows: 2,
-		placeholder: single ? "sunset, coast" : "(leave unchanged)"
-	})), /* @__PURE__ */ React.createElement(Field, { label: "Capture time" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
+		placeholder: single ? "sunset, coast" : keep
+	})), /* @__PURE__ */ React.createElement(Field, {
+		label: "IPTC",
+		hint: "Kept in the .xmp sidecar for every format; the original file is never changed for these."
+	}, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
+		value: group,
+		onChange: (v) => setGroup(v),
+		options: IPTC_GROUPS.map((g) => ({
+			value: g.value,
+			label: groupTouched(g.value) ? `${g.label} •` : g.label
+		}))
+	}), IPTC_FIELDS.filter((f) => f.group === group).map((f) => /* @__PURE__ */ React.createElement(Field, {
+		key: f.key,
+		label: f.label
+	}, iptcInput(f))), iptcErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, iptcErr))), /* @__PURE__ */ React.createElement(Hint, null, "Text fields take the rename tokens, filled in for each photo: ", "{date}", ", ", "{yyyy}", ", ", "{mon}", ", ", "{day}", ", ", "{name}", ",", " {seq}", ", ", "{folder}", ", ", "{make}", ", ", "{model}", ", ", "{lens}", "…"), /* @__PURE__ */ React.createElement(Field, { label: "Capture time" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
 		value: dateMode,
 		onChange: (v) => setDateMode(v),
 		options: [
@@ -2235,7 +2883,28 @@ function MetadataTab() {
 		full: true,
 		disabled: !canApply,
 		onClick: run
-	}, applying ? "Writing…" : `Apply to ${targets.length || ""} photo${targets.length === 1 ? "" : "s"}`))), /* @__PURE__ */ React.createElement(Section, { title: single ? "Inspector" : "Inspector (first selected)" }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Nothing selected."), targets.length > 0 && dumpErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, dumpErr), targets.length > 0 && !dumpErr && dump === null && /* @__PURE__ */ React.createElement(Hint, null, "Reading…"), dump !== null && dump.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "No EXIF metadata found in this file."), dump !== null && dump.length > 0 && /* @__PURE__ */ React.createElement(TagDump, { rows: dump })));
+	}, applying ? "Writing…" : `Apply to ${targets.length || ""} photo${targets.length === 1 ? "" : "s"}`))), /* @__PURE__ */ React.createElement(Section, { title: "Templates" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Select, {
+		value: "",
+		onChange: loadTemplate,
+		placeholder: templates.length ? "Fill in from a template…" : "No templates yet",
+		disabled: templates.length === 0,
+		options: templates.map((t) => ({
+			value: t.name,
+			label: t.name
+		}))
+	}), /* @__PURE__ */ React.createElement(Row, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement(TextInput, {
+		value: templateName,
+		onChange: setTemplateName,
+		placeholder: "Save filled-in fields as…"
+	})), /* @__PURE__ */ React.createElement(Button, {
+		size: "sm",
+		onClick: saveTemplate,
+		disabled: !templateName.trim()
+	}, savedTemplate ? "Update" : "Save"), savedTemplate && /* @__PURE__ */ React.createElement(Button, {
+		size: "sm",
+		variant: "danger",
+		onClick: deleteTemplate
+	}, "Delete")), /* @__PURE__ */ React.createElement(Hint, null, "A template fills in its fields; Apply writes them. Tokens such as ", "{date}", " stay tokens until then."))), /* @__PURE__ */ React.createElement(Section, { title: single ? "Inspector" : "Inspector (first selected)" }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Nothing selected."), targets.length > 0 && dumpErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, dumpErr), targets.length > 0 && !dumpErr && dump === null && /* @__PURE__ */ React.createElement(Hint, null, "Reading…"), dump !== null && dump.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "No EXIF metadata found in this file."), dump !== null && dump.length > 0 && /* @__PURE__ */ React.createElement(TagDump, { rows: dump })));
 }
 function TagDump({ rows }) {
 	const { tokens } = ui;
@@ -2322,6 +2991,53 @@ function ToolsPanel() {
 }
 
 //#endregion
+//#region src/metadata/export.ts
+const EXPORT_SETTINGS = [{
+	key: "embed",
+	label: "Embed IPTC metadata",
+	hint: "JPEG only: creator, copyright, caption and the IPTC fields from the Metadata tab, as XMP and IPTC-IIM.",
+	type: "boolean",
+	default: false
+}, {
+	key: "keywords",
+	label: "Include keywords",
+	type: "boolean",
+	default: true
+}];
+function isJpeg(bytes) {
+	return bytes.length > 2 && bytes[0] === 255 && bytes[1] === 216;
+}
+/** What the export carries: creator, copyright and caption as the catalogue
+*  holds them, keywords if asked, and the IPTC fields from the sidecar. */
+async function exportMeta(photo, keywords) {
+	const meta = {};
+	if (photo.exif.artist) meta.artist = photo.exif.artist;
+	if (photo.exif.copyright) meta.copyright = photo.exif.copyright;
+	if (photo.exif.imageDescription) meta.description = photo.exif.imageDescription;
+	if (keywords && photo.keywords?.length) meta.keywords = [...photo.keywords];
+	const iptc = await readIptc(photo);
+	if (Object.keys(iptc).length) meta.iptc = iptc;
+	return meta;
+}
+/** `blob` with the photo's IPTC metadata embedded, or `blob` itself when the
+*  option is off, the export isn't a JPEG, or there is nothing to embed. A
+*  failure keeps the export as it was rather than failing it. */
+async function embedForExport(blob, photo, settings) {
+	if (settings.embed !== true) return blob;
+	try {
+		const bytes = new Uint8Array(await blob.arrayBuffer());
+		if (!isJpeg(bytes)) return blob;
+		const meta = await exportMeta(photo, settings.keywords !== false);
+		if (Object.keys(meta).length === 0) return blob;
+		const out = embedIptcInJpeg(bytes, upsertXmp(null, { meta }), buildIim(meta));
+		return new Blob([out], { type: blob.type || "image/jpeg" });
+	} catch (e) {
+		console.warn(`[Advanced EXIF Tools] IPTC not embedded in ${photo.filename}:`, e);
+		return blob;
+	}
+}
+
+//#endregion
 //#region src/index.tsx
 const ID = "anthonyreimche.advanced-exif-tools";
 const PANEL_ID = `${ID}.panel`;
@@ -2361,6 +3077,12 @@ function activate(api) {
 	api.registerCatalogHooks({
 		id: `${ID}.sidecar`,
 		onPhotoImport: (ctx) => readSidecarForImport(ctx)
+	});
+	api.registerExportProcessor({
+		id: `${ID}.iptc`,
+		label: "IPTC metadata",
+		settings: EXPORT_SETTINGS,
+		process: (blob, photo, settings) => embedForExport(blob, photo, settings)
 	});
 }
 

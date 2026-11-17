@@ -2,6 +2,8 @@
 // that convert between the app's display forms and the EXIF/XMP wire forms.
 
 import type { CatalogPhoto } from "../safelight-api";
+import { expandTokens } from "../rename/engine";
+import type { IptcValues } from "./iptc";
 
 /** Descriptive / rights / authorship fields. A present key means "write this";
  *  an empty string means "clear the tag". Absent keys are left untouched, so a
@@ -14,6 +16,26 @@ export interface EditableMeta {
   /** Decimal degrees; write both or neither. */
   gpsLat?: number;
   gpsLon?: number;
+  /** IPTC Core fields kept in the XMP sidecar (see iptc.ts). */
+  iptc?: IptcValues;
+}
+
+/** `edits` for one photo of a batch: {tokens} in its text fields resolved for
+ *  `photo` at position `index`. Keywords and copyright status stay literal. */
+export function expandEdits(edits: EditableMeta, photo: CatalogPhoto, index: number): EditableMeta {
+  const expand = (s: string | undefined) => (s === undefined ? undefined : expandTokens(s, photo, index));
+  const out: EditableMeta = { ...edits };
+  if (edits.artist !== undefined) out.artist = expand(edits.artist);
+  if (edits.copyright !== undefined) out.copyright = expand(edits.copyright);
+  if (edits.description !== undefined) out.description = expand(edits.description);
+  if (edits.iptc) {
+    const iptc: IptcValues = {};
+    for (const [key, value] of Object.entries(edits.iptc) as [keyof IptcValues, string][]) {
+      iptc[key] = key === "copyrightStatus" ? value : expandTokens(value, photo, index);
+    }
+    out.iptc = iptc;
+  }
+  return out;
 }
 
 /** How to change the capture time. "set" writes one absolute time to all;

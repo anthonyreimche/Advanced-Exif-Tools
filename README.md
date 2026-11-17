@@ -63,6 +63,51 @@ thumbnail tag, not just the handful the Info panel shows).
 Keywords are stored in the catalogue for every format (and in the sidecar for
 RAW); the other fields are written into the file's EXIF for JPEG/TIFF.
 
+### IPTC
+
+The **IPTC** fields, grouped as Content, Rights, Location and Workflow:
+
+| Field | XMP | IPTC-IIM |
+|---|---|---|
+| Title | `dc:title` | 2:05 Object Name |
+| Headline | `photoshop:Headline` | 2:105 |
+| Caption writer | `photoshop:CaptionWriter` | 2:122 |
+| Copyright status | `xmpRights:Marked` | — |
+| Rights usage terms | `xmpRights:UsageTerms` | — |
+| Copyright info URL | `xmpRights:WebStatement` | — |
+| Credit line | `photoshop:Credit` | 2:110 |
+| Source | `photoshop:Source` | 2:115 |
+| Creator's job title | `photoshop:AuthorsPosition` | 2:85 |
+| Sublocation | `Iptc4xmpCore:Location` | 2:92 |
+| City | `photoshop:City` | 2:90 |
+| Province / state | `photoshop:State` | 2:95 |
+| Country | `photoshop:Country` | 2:101 |
+| Country code | `Iptc4xmpCore:CountryCode` | 2:100 |
+| Job ID | `photoshop:TransmissionReference` | 2:103 |
+| Instructions | `photoshop:Instructions` | 2:40 |
+
+These always go to the `.xmp` sidecar, whatever the format, so an IPTC edit
+never rewrites an original. For a JPEG captioned elsewhere (Photo Mechanic, a
+camera), the editor shows the XMP and IPTC-IIM already in the file until the
+sidecar has its own value. Lightroom-style sidecars, which keep these as
+attributes, are read and updated too.
+
+**Templates** save the filled-in fields under a name; choosing one fills those
+fields in the form for the current selection, and **Apply** writes them.
+
+**Variables:** every text field takes the rename tokens (`{date}`, `{yyyy}`,
+`{name}`, `{seq}`, `{folder}`, `{make}`, `{model}`, …), filled in per photo
+when you apply, so `{name} — {city}` style captions and `Shot {date}` headlines
+work across a batch. Unknown `{words}` are left as typed.
+
+### Export
+
+The Export panel gains an **IPTC metadata** section. With **Embed IPTC
+metadata** on (it is off by default, like Safelight's own metadata option),
+exported JPEGs carry creator, copyright, caption, keywords (unless *Include
+keywords* is off) and the IPTC fields, as both an XMP packet and IPTC-IIM, the
+forms picture desks and wire services read. Other formats export unchanged.
+
 ## Install
 
 Install from the in-app **Extensions** store, or clone this repo into

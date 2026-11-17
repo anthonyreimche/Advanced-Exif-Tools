@@ -5,12 +5,19 @@
 // so the app shows sidecar edits after a rescan (via the onPhotoImport hook).
 
 import type { EditableMeta } from "./model";
+import { IPTC_FIELDS, type IptcValues, type XmpForm } from "./iptc";
 
-const NS = {
+const NS: Record<string, string> = {
   dc: "http://purl.org/dc/elements/1.1/",
   exif: "http://ns.adobe.com/exif/1.0/",
   xmp: "http://ns.adobe.com/xap/1.0/",
+  photoshop: "http://ns.adobe.com/photoshop/1.0/",
+  Iptc4xmpCore: "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
+  xmpRights: "http://ns.adobe.com/xap/1.0/rights/",
 };
+
+/** Namespaces every fresh packet declares, used or not. */
+const BASE_PREFIXES = ["dc", "exif", "xmp"];
 
 const XMPTK = "Advanced EXIF Tools";
 
@@ -126,16 +133,39 @@ function managedElements(fields: PacketFields): { tag: string; xml: string | nul
     out.push({ tag: "exif:GPSLatitude", xml: `<exif:GPSLatitude>${decimalToXmp(meta.gpsLat, "N", "S")}</exif:GPSLatitude>` });
     out.push({ tag: "exif:GPSLongitude", xml: `<exif:GPSLongitude>${decimalToXmp(meta.gpsLon, "E", "W")}</exif:GPSLongitude>` });
   }
+  for (const f of IPTC_FIELDS) {
+    const value = meta.iptc?.[f.key];
+    if (value === undefined) continue;
+    out.push({ tag: f.xmp, xml: value ? iptcElement(f.xmp, f.form, value) : null });
+  }
   return out;
 }
 
-function freshPacket(inner: string): string {
+function iptcElement(tag: string, form: XmpForm, value: string): string {
+  if (form === "alt") {
+    return `<${tag}><rdf:Alt><rdf:li xml:lang="x-default">${esc(value)}</rdf:li></rdf:Alt></${tag}>`;
+  }
+  if (form === "marked") return `<${tag}>${value === "public" ? "False" : "True"}</${tag}>`;
+  return `<${tag}>${esc(value)}</${tag}>`;
+}
+
+/** The known namespace prefixes the serialized elements use. */
+function prefixesIn(elements: string[]): string[] {
+  const used = new Set<string>();
+  for (const el of elements) {
+    for (const m of el.matchAll(/<([A-Za-z][\w-]*):/g)) if (NS[m[1]]) used.add(m[1]);
+  }
+  return [...used];
+}
+
+function freshPacket(inner: string, used: string[]): string {
+  const prefixes = [...BASE_PREFIXES, ...used.filter((p) => !BASE_PREFIXES.includes(p))];
   return (
     `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n` +
     `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="${XMPTK}">\n` +
     ` <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n` +
     `  <rdf:Description rdf:about=""\n` +
-    `    xmlns:dc="${NS.dc}"\n    xmlns:exif="${NS.exif}"\n    xmlns:xmp="${NS.xmp}">\n` +
+    `${prefixes.map((p) => `    xmlns:${p}="${NS[p]}"`).join("\n")}>\n` +
     `   ${inner}\n` +
     `  </rdf:Description>\n` +
     ` </rdf:RDF>\n` +
@@ -151,7 +181,7 @@ export function upsertXmp(existing: string | null, fields: PacketFields): string
   const additions = managed.filter((m) => m.xml).map((m) => m.xml!) as string[];
 
   if (!existing || !/<rdf:Description[\s>]/.test(existing)) {
-    return freshPacket(additions.join("\n   "));
+    return freshPacket(additions.join("\n   "), prefixesIn(additions));
   }
 
   let text = existing;
@@ -160,19 +190,23 @@ export function upsertXmp(existing: string | null, fields: PacketFields): string
   text = text.replace(/<rdf:Description\b([^>]*?)\/\s*>/, "<rdf:Description$1></rdf:Description>");
   // Remove any prior copies of the properties we manage (element form; these
   // fields aren't used in attribute form by mainstream writers).
+  // The lookaheads keep e.g. photoshop:City from matching photoshop:CityCode.
+  // Lightroom writes simple properties as attributes on the Description, so
+  // the attribute form goes too.
   for (const m of managed) {
-    const re = new RegExp(`\\s*<${m.tag}[\\s\\S]*?<\\/${m.tag}>`, "g");
-    text = text.replace(re, "");
-    // Also drop a self-closing / attribute form just in case.
-    text = text.replace(new RegExp(`\\s*<${m.tag}\\b[^>]*/>`, "g"), "");
+    text = text.replace(new RegExp(`\\s*<${m.tag}(?=[\\s>])[\\s\\S]*?<\\/${m.tag}>`, "g"), "");
+    text = text.replace(new RegExp(`\\s*<${m.tag}(?=[\\s/])[^>]*/>`, "g"), "");
     text = text.replace(new RegExp(`\\s+${m.tag}="[^"]*"`, "g"), "");
   }
 
   // Make sure the namespaces we use are declared on the first Description tag.
+  const used = prefixesIn(additions);
   text = text.replace(/<rdf:Description\b([^>]*)>/, (_full, attrs: string) => {
     let a = attrs;
     if (!/xmlns:dc=/.test(a)) a += ` xmlns:dc="${NS.dc}"`;
-    if (!/xmlns:exif=/.test(a) && additions.some((x) => x.includes("exif:"))) a += ` xmlns:exif="${NS.exif}"`;
+    for (const p of used) {
+      if (!a.includes(`xmlns:${p}=`)) a += ` xmlns:${p}="${NS[p]}"`;
+    }
     return `<rdf:Description${a}>`;
   });
 
@@ -184,14 +218,30 @@ export function upsertXmp(existing: string | null, fields: PacketFields): string
 
 // ── reading ──────────────────────────────────────────────────────────────────
 
-function firstAltOrSeq(xmp: string, tag: string): string | undefined {
-  const block = new RegExp(`<${tag}[\\s\\S]*?>([\\s\\S]*?)</${tag}>`).exec(xmp);
+/** A property's value: the first rdf:li of an Alt/Seq/Bag, the element's own
+ *  text, or the attribute form. Undefined when absent or empty. */
+function readProp(xmp: string, tag: string): string | undefined {
+  const block = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`).exec(xmp);
   if (block) {
     const li = /<rdf:li(?:\s[^>]*)?>([\s\S]*?)<\/rdf:li>/.exec(block[1]);
-    if (li) return unesc(li[1].trim());
+    const inner = li ? li[1] : block[1].includes("<") ? "" : block[1];
+    const v = unesc(inner.trim());
+    if (v) return v;
   }
   const attr = new RegExp(`\\s${tag}="([^"]*)"`).exec(xmp);
-  return attr ? unesc(attr[1].trim()) : undefined;
+  return (attr && unesc(attr[1].trim())) || undefined;
+}
+
+function readIptcProps(xmp: string): IptcValues {
+  const out: IptcValues = {};
+  for (const f of IPTC_FIELDS) {
+    const v = readProp(xmp, f.xmp);
+    if (!v) continue;
+    if (f.form !== "marked") out[f.key] = v;
+    else if (/^true$/i.test(v)) out[f.key] = "copyrighted";
+    else if (/^false$/i.test(v)) out[f.key] = "public";
+  }
+  return out;
 }
 
 function bagItems(xmp: string, tag: string): string[] {
@@ -224,12 +274,14 @@ function xmpGpsToDecimal(value: string): number | undefined {
 /** Parse the fields we manage out of an XMP sidecar's text. */
 export function readXmp(text: string): SidecarData {
   const meta: EditableMeta = {};
-  const creator = firstAltOrSeq(text, "dc:creator");
+  const creator = readProp(text, "dc:creator");
   if (creator) meta.artist = creator;
-  const rights = firstAltOrSeq(text, "dc:rights");
+  const rights = readProp(text, "dc:rights");
   if (rights) meta.copyright = rights;
-  const desc = firstAltOrSeq(text, "dc:description");
+  const desc = readProp(text, "dc:description");
   if (desc) meta.description = desc;
+  const iptc = readIptcProps(text);
+  if (Object.keys(iptc).length) meta.iptc = iptc;
   const kws = bagItems(text, "dc:subject");
   if (kws.length) meta.keywords = kws;
 

@@ -6,12 +6,13 @@
 
 import { api } from "../rt";
 import type { CatalogPhoto } from "../safelight-api";
-import { type EditableMeta, type DateOp, resolveDate, decimalToDms } from "./model";
+import { type EditableMeta, type DateOp, resolveDate, decimalToDms, expandEdits } from "./model";
 import {
   parseTiff, serializeTiff, setAscii, getAscii, ensureExif, ensureGps, setRationals,
   type Tiff, type IfdNode,
 } from "./tiff";
-import { getExifTiff, writeExifIntoJpeg } from "./jpeg";
+import { getExifTiff, writeExifIntoJpeg, readEmbeddedMeta } from "./jpeg";
+import { parseIim, type IptcValues } from "./iptc";
 import { upsertXmp, readXmp, sidecarName, legacySidecarName, isOwnPacket } from "./xmp";
 
 const IFD0_DESC = 0x010e;
@@ -44,7 +45,12 @@ function extOf(filename: string): string {
   return i >= 0 ? filename.slice(i + 1).toLowerCase() : "";
 }
 
-function hasAnyEdit(edits: EditableMeta, dateStr: string | null): boolean {
+function hasIptcEdit(edits: EditableMeta): boolean {
+  return !!edits.iptc && Object.keys(edits.iptc).length > 0;
+}
+
+/** Whether anything outside the IPTC sidecar fields changes. */
+function hasFileEdit(edits: EditableMeta, dateStr: string | null): boolean {
   return (
     dateStr != null ||
     edits.artist !== undefined ||
@@ -241,6 +247,8 @@ function withEdits(current: CatalogPhoto, edits: EditableMeta, dateStr: string |
 
 interface Written {
   id: string;
+  /** The edits as written for this photo, its {tokens} resolved. */
+  edits: EditableMeta;
   dateStr: string | null;
   result: WriteResult;
 }
@@ -248,14 +256,14 @@ interface Written {
 /** Reflect written edits into the catalogue so the grid/info update this session
  *  and survive a reload. Each record is rebuilt from the store as it is now, so
  *  a rating, flag or keyword changed while the files were written stays. */
-async function updateCatalog(written: Written[], edits: EditableMeta): Promise<void> {
+async function updateCatalog(written: Written[]): Promise<void> {
   if (written.length === 0) return;
   const store = api.stores.useCatalogStore.getState();
   const byId = new Map(written.map((w) => [w.id, w] as const));
   const updated: CatalogPhoto[] = [];
   for (const p of store.photos) {
     const w = byId.get(p.id);
-    if (w) updated.push(withEdits(p, edits, w.dateStr));
+    if (w) updated.push(withEdits(p, w.edits, w.dateStr));
   }
   try {
     await store.relocatePhotos(updated);
@@ -273,7 +281,10 @@ export interface ApplyProgress {
   current: string;
 }
 
-/** Apply `edits` + `dateOp` to each photo, returning a per-photo result. */
+/** Apply `edits` + `dateOp` to each photo, returning a per-photo result. Text
+ *  fields' {tokens} resolve per photo, by its position in `targets`. IPTC
+ *  fields always go to the XMP sidecar, so an IPTC-only edit never rewrites a
+ *  JPEG or TIFF. */
 export async function applyMetadata(
   targets: CatalogPhoto[],
   edits: EditableMeta,
@@ -284,9 +295,11 @@ export async function applyMetadata(
   let pending: Written[] = [];
   let done = 0;
 
-  for (const photo of targets) {
+  for (const [index, photo] of targets.entries()) {
     onProgress?.({ done, total: targets.length, current: photo.filename });
     const dateStr = resolveDate(dateOp, photo);
+    const own = expandEdits(edits, photo, index);
+    const fileEdit = hasFileEdit(own, dateStr);
 
     if (photo.copyOf) {
       // A copy shares its master's file and sidecar; writing would change the master.
@@ -294,7 +307,7 @@ export async function applyMetadata(
       done++;
       continue;
     }
-    if (!hasAnyEdit(edits, dateStr)) {
+    if (!fileEdit && !hasIptcEdit(own)) {
       results.push({ id: photo.id, name: photo.filename, ok: true, mode: "in-place", reason: "No change" });
       done++;
       continue;
@@ -306,32 +319,43 @@ export async function applyMetadata(
     }
 
     const ext = extOf(photo.filename);
-    const inPlace = ext === "jpg" || ext === "jpeg" || ext === "tif" || ext === "tiff";
+    const inPlace = fileEdit && !!photo.fileHandle && ["jpg", "jpeg", "tif", "tiff"].includes(ext);
     let mode: WriteMode = inPlace ? "in-place" : "sidecar";
     let reason: string | undefined;
 
     try {
+      let wroteFile = false;
       if (inPlace && photo.fileHandle) {
         const buf = new Uint8Array(await (await photo.fileHandle.getFile()).arrayBuffer());
-        let out: Uint8Array;
         try {
-          out = ext === "jpg" || ext === "jpeg" ? editJpeg(buf, edits, dateStr) : editTiff(buf, edits, dateStr);
+          const out = ext === "jpg" || ext === "jpeg" ? editJpeg(buf, own, dateStr) : editTiff(buf, own, dateStr);
           await writeBytes(photo.fileHandle, out);
+          wroteFile = true;
         } catch (e) {
           // In-place refused (unsupported layout / verification) — degrade to a
           // sidecar so the edit is never lost and the original is never risked.
           mode = "sidecar";
           reason = e instanceof Error ? `In-place unavailable: ${e.message} — wrote sidecar` : "Wrote sidecar";
-          await writeSidecar(photo, edits, dateStr);
+          await writeSidecar(photo, own, dateStr);
         }
       } else {
-        await writeSidecar(photo, edits, dateStr);
+        await writeSidecar(photo, own, dateStr);
       }
       const result: WriteResult = { id: photo.id, name: photo.filename, ok: true, mode, reason };
+      if (wroteFile && hasIptcEdit(own)) {
+        try {
+          await writeSidecar(photo, { iptc: own.iptc }, null);
+        } catch (e) {
+          result.ok = false;
+          result.reason = `EXIF written, but the IPTC sidecar failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
       results.push(result);
-      pending.push({ id: photo.id, dateStr, result });
+      // Recorded even when only the IPTC sidecar failed: the catalogue has to
+      // match the file that was rewritten.
+      pending.push({ id: photo.id, edits: own, dateStr, result });
       if (pending.length >= CATALOG_BATCH) {
-        await updateCatalog(pending, edits);
+        await updateCatalog(pending);
         pending = [];
       }
     } catch (e) {
@@ -345,7 +369,7 @@ export async function applyMetadata(
     }
     done++;
   }
-  await updateCatalog(pending, edits);
+  await updateCatalog(pending);
 
   onProgress?.({ done, total: targets.length, current: "" });
   return results;
@@ -382,4 +406,33 @@ export async function readSidecarForImport(ctx: {
   } catch {
     return; // unreadable sidecar — nothing to merge
   }
+}
+
+const HEAD_BYTES = 1 << 20; // XMP and APP13 sit before the scan
+
+/** The photo's IPTC fields: its XMP sidecar first, then, for a JPEG, the XMP
+ *  and IPTC-IIM embedded in the file (a caption written by another app).
+ *  Throws when the sidecar exists but can't be read. */
+export async function readIptc(photo: CatalogPhoto): Promise<IptcValues> {
+  let embedded: IptcValues = {};
+  const ext = extOf(photo.filename);
+  if ((ext === "jpg" || ext === "jpeg") && photo.fileHandle) {
+    try {
+      const file = await photo.fileHandle.getFile();
+      const head = file.size > HEAD_BYTES ? file.slice(0, HEAD_BYTES) : file;
+      const found = readEmbeddedMeta(new Uint8Array(await head.arrayBuffer()));
+      embedded = {
+        ...(found.iim ? parseIim(found.iim).iptc : {}),
+        ...(found.xmp ? readXmp(found.xmp).meta.iptc : {}),
+      };
+    } catch {
+      // An unreadable original only loses the embedded fallback.
+    }
+  }
+  const dir = photo.directoryHandle;
+  const text = dir
+    ? ((await sidecarText(dir, sidecarName(photo.filename))) ??
+      (await sidecarText(dir, legacySidecarName(photo.filename))))
+    : null;
+  return { ...embedded, ...(text ? readXmp(text).meta.iptc : {}) };
 }

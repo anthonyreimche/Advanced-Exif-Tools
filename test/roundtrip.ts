@@ -15,6 +15,16 @@ import {
 } from "../src/rename/engine";
 import { applyRename } from "../src/rename/apply";
 import { extractSubsec } from "../src/rename/subsec";
+import { IPTC_FIELDS, buildIim, parseIim, type IptcValues } from "../src/metadata/iptc";
+import { embedIptcInJpeg, readEmbeddedMeta } from "../src/metadata/jpeg";
+import { readIptc } from "../src/metadata/apply";
+import { embedForExport } from "../src/metadata/export";
+import { expandEdits } from "../src/metadata/model";
+import {
+  emptyForm, formToEdits, templateFromForm, applyTemplate, upsertTemplate, removeTemplate,
+  type FormTouched,
+} from "../src/metadata/form";
+import { expandTokens } from "../src/rename/engine";
 import { initRuntime } from "../src/rt";
 import type { CatalogPhoto, RenamePhotoResult, SafelightAPI } from "../src/safelight-api";
 
@@ -686,6 +696,267 @@ async function testRenameRecovery(): Promise<void> {
   );
 }
 
+// ── IPTC ─────────────────────────────────────────────────────────────────────
+
+const ALL_IPTC: IptcValues = {
+  title: "Final",
+  headline: "Leafs win",
+  captionWriter: "AR",
+  authorsPosition: "Staff",
+  copyrightStatus: "copyrighted",
+  usageTerms: "Editorial use only",
+  webStatement: "https://example.com/rights",
+  credit: "Safelight Wire",
+  source: "AR Photo",
+  sublocation: "Rogers Arena",
+  city: "Vancouver",
+  state: "BC",
+  country: "Canada",
+  countryCode: "CAN",
+  jobId: "J-42",
+  instructions: "No resale",
+};
+
+function asciiCount(buf: Uint8Array, s: string): number {
+  const needle = [...s].map((c) => c.charCodeAt(0));
+  let n = 0;
+  for (let i = 0; i + needle.length <= buf.length; i++) {
+    if (needle.every((b, j) => buf[i + j] === b)) n++;
+  }
+  return n;
+}
+
+function testIptcXmp(): void {
+  console.log("IPTC in XMP:");
+  ok("field table covers every key", IPTC_FIELDS.length === Object.keys(ALL_IPTC).length);
+  const packet = upsertXmp(null, { meta: { artist: "Jo", iptc: ALL_IPTC } });
+  const back = readXmp(packet).meta.iptc ?? {};
+  ok("every IPTC field round-trips", IPTC_FIELDS.every((f) => back[f.key] === ALL_IPTC[f.key]), JSON.stringify(back));
+  ok("creator still round-trips", readXmp(packet).meta.artist === "Jo");
+  ok("photoshop namespace declared", packet.includes('xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"'));
+  ok("Iptc4xmpCore namespace declared", packet.includes('xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"'));
+  ok("xmpRights namespace declared", packet.includes('xmlns:xmpRights="http://ns.adobe.com/xap/1.0/rights/"'));
+  ok("copyright status writes Marked=True", /<xmpRights:Marked>True<\/xmpRights:Marked>/.test(packet));
+  const pd = readXmp(upsertXmp(null, { meta: { iptc: { copyrightStatus: "public" } } })).meta.iptc;
+  ok("public domain round-trips as Marked=False", pd?.copyrightStatus === "public");
+
+  // Lightroom writes simple properties as attributes on the Description.
+  const lr = `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    photoshop:City="Victoria" photoshop:Headline="Old head" crs:Exposure2012="+0.50">
+   <photoshop:CityCode>keep</photoshop:CityCode>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>`;
+  ok("reads attribute-form city", readXmp(lr).meta.iptc?.city === "Victoria");
+  const up = upsertXmp(lr, { meta: { iptc: { headline: "New head", city: "" } } });
+  const upRead = readXmp(up).meta.iptc ?? {};
+  ok("replaces attribute-form headline", upRead.headline === "New head" && !up.includes("Old head"));
+  ok("empty value clears the field", upRead.city === undefined && !up.includes("Victoria"));
+  ok("foreign attribute survives", up.includes('crs:Exposure2012="+0.50"'));
+  ok("tag-prefix lookalike survives", up.includes("<photoshop:CityCode>keep</photoshop:CityCode>"));
+  ok(
+    "absent keys are untouched",
+    readXmp(upsertXmp(packet, { meta: { iptc: { city: "Banff" } } })).meta.iptc?.credit === "Safelight Wire",
+  );
+  ok(
+    "special characters escaped",
+    readXmp(upsertXmp(null, { meta: { iptc: { credit: "A & B <C>" } } })).meta.iptc?.credit === "A & B <C>",
+  );
+}
+
+function testIim(): void {
+  console.log("IPTC-IIM:");
+  const iim = buildIim({
+    artist: "Jo",
+    copyright: "© Jo",
+    description: "Café",
+    keywords: ["a", "b"],
+    iptc: { headline: "H", city: "Vancouver", countryCode: "CAN", usageTerms: "xmp only" },
+  });
+  const back = parseIim(iim);
+  ok("by-line", back.artist === "Jo");
+  ok("copyright UTF-8", back.copyright === "© Jo");
+  ok("caption UTF-8", back.description === "Café");
+  ok("keywords repeat", JSON.stringify(back.keywords) === '["a","b"]');
+  ok("headline", back.iptc?.headline === "H");
+  ok("city", back.iptc?.city === "Vancouver");
+  ok("XMP-only fields stay out", back.iptc?.usageTerms === undefined);
+  ok("declares UTF-8 (1:90 ESC % G)", indexOfBytes(iim, [0x1c, 0x01, 0x5a, 0x00, 0x03, 0x1b, 0x25, 0x47]) >= 0);
+  const long = parseIim(buildIim({ iptc: { city: "é".repeat(40) } })).iptc?.city ?? "";
+  ok("over-long values truncate on a character boundary", long === "é".repeat(16), `${long.length}`);
+  const latin = new Uint8Array([0x1c, 0x02, 0x5a, 0x00, 0x04, 0x4d, 0x6f, 0x6e, 0xe9]);
+  ok("Latin-1 without a charset marker", parseIim(latin).iptc?.city === "Moné");
+}
+
+function testJpegEmbed(): void {
+  console.log("JPEG XMP + IIM embedding:");
+  const src = writeExifIntoJpeg(BARE_JPEG, cameraTiff(false));
+  const once = embedIptcInJpeg(
+    src,
+    upsertXmp(null, { meta: { iptc: { headline: "H1" } } }),
+    buildIim({ iptc: { headline: "H1" } }),
+  );
+  const twice = embedIptcInJpeg(
+    once,
+    upsertXmp(null, { meta: { iptc: { headline: "H2" } } }),
+    buildIim({ iptc: { headline: "H2" } }),
+  );
+  const emb = readEmbeddedMeta(twice);
+  ok("XMP readable", readXmp(emb.xmp ?? "").meta.iptc?.headline === "H2");
+  ok("IIM readable", parseIim(emb.iim ?? new Uint8Array()).iptc?.headline === "H2");
+  ok("one XMP segment after re-embed", asciiCount(twice, "http://ns.adobe.com/xap/1.0/\0") === 1);
+  ok("one Photoshop segment after re-embed", asciiCount(twice, "Photoshop 3.0\0") === 1);
+  const exif = getExifTiff(twice);
+  ok("EXIF kept", !!exif && getAscii(parseTiff(exif, 0)?.ifd0, T_MAKE) === "TESTCAM");
+  ok("EXIF APP1 stays first", twice[3] === 0xe1 && asciiCount(twice.subarray(4, 10), "Exif") === 1);
+  ok("scan data unchanged", sameBytes(twice.subarray(twice.length - 4), BARE_JPEG.subarray(2)));
+  let threw = false;
+  try {
+    embedIptcInJpeg(src, "x".repeat(70000), new Uint8Array());
+  } catch {
+    threw = true;
+  }
+  ok("oversized XMP refused", threw);
+  ok("no embedded metadata reads as empty", readEmbeddedMeta(BARE_JPEG).xmp === null && readEmbeddedMeta(BARE_JPEG).iim === null);
+}
+
+function testCaptionTokens(): void {
+  console.log("Caption variables:");
+  const p = fakePhoto({
+    filename: "DSC_0042.NEF",
+    exif: { dateTimeOriginal: "2026:06:30 14:05:42", shutterSpeed: "1/250", cameraModel: "Z8" },
+  });
+  ok("tokens expand", expandTokens("{yyyy}-{mon}-{day} {name} #{seq}", p, 4) === "2026-06-30 DSC_0042 #005");
+  ok("values are not filename-sanitized", expandTokens("{shutter}", p, 0) === "1/250");
+  ok("unknown tokens stay verbatim", expandTokens("Score {home}-{away}", p, 0) === "Score {home}-{away}");
+  ok("text without tokens is unchanged", expandTokens("Plain, text.", p, 0) === "Plain, text.");
+  const e = expandEdits(
+    { description: "{model} frame {seq:2}", iptc: { headline: "{date}", copyrightStatus: "copyrighted" }, keywords: ["{name}"] },
+    p,
+    1,
+  );
+  ok("caption expanded per photo", e.description === "Z8 frame 02");
+  ok("IPTC text expanded", e.iptc?.headline === "20260630");
+  ok("keywords left literal", e.keywords?.[0] === "{name}");
+}
+
+function testTemplates(): void {
+  console.log("Metadata templates:");
+  const values = { ...emptyForm(), copyright: "© AR", credit: "Wire", city: "", headline: "  " };
+  const tpl = templateFromForm("Wire", values);
+  ok("template keeps filled fields", tpl.values.copyright === "© AR" && tpl.values.credit === "Wire");
+  ok("template drops empty fields", !("city" in tpl.values) && !("headline" in tpl.values));
+  const applied = applyTemplate({ ...emptyForm(), artist: "Kim" }, {}, tpl);
+  ok("apply fills the template's fields", applied.values.credit === "Wire" && applied.values.copyright === "© AR");
+  ok("apply marks them touched", applied.touched.credit === true && applied.touched.copyright === true);
+  ok("apply leaves other fields", applied.values.artist === "Kim" && !applied.touched.artist);
+  const edits = formToEdits(applied.values, applied.touched);
+  ok("touched fields become edits", edits.iptc?.credit === "Wire" && edits.copyright === "© AR");
+  ok("untouched fields are not edits", edits.artist === undefined && edits.iptc?.city === undefined);
+  const cleared = formToEdits({ ...emptyForm() }, { city: true } as FormTouched);
+  ok("a touched empty field clears", cleared.iptc?.city === "");
+  ok("no IPTC touched, no IPTC edits", formToEdits(emptyForm(), { artist: true }).iptc === undefined);
+  const kw = formToEdits({ ...emptyForm(), keywords: "a, b,\na" }, { keywords: true });
+  ok("keywords parsed and de-duplicated", JSON.stringify(kw.keywords) === '["a","b"]');
+  let list = upsertTemplate([], tpl);
+  list = upsertTemplate(list, templateFromForm("Agency", values));
+  list = upsertTemplate(list, templateFromForm("wire", { ...emptyForm(), source: "S" }));
+  ok("same name (any case) replaces", list.length === 2 && list.find((t) => t.name === "wire")?.values.source === "S");
+  ok("sorted by name", list.map((t) => t.name).join() === "Agency,wire");
+  ok("remove by name", removeTemplate(list, "Agency").map((t) => t.name).join() === "wire");
+}
+
+async function testIptcApply(): Promise<void> {
+  console.log("IPTC apply / read:");
+  const jpg = writeExifIntoJpeg(BARE_JPEG, cameraTiff(false));
+
+  const file = fakeFile(jpg);
+  const dir = fakeDir();
+  const photo = fakePhoto({ id: "j1", filename: "IMG.JPG", fileHandle: file.handle, directoryHandle: dir });
+  installFakeApi([photo]);
+  const r = await applyMetadata([photo], { iptc: { headline: "H", city: "Vancouver" } }, { kind: "none" });
+  ok("IPTC-only edit leaves the original alone", file.state.writes === 0);
+  ok("IPTC fields go to the sidecar", readXmp(dir.files.get("IMG_jpg.xmp") ?? "").meta.iptc?.headline === "H");
+  ok("reported as sidecar", r[0]?.ok === true && r[0]?.mode === "sidecar", JSON.stringify(r[0]));
+
+  const file2 = fakeFile(jpg);
+  const dir2 = fakeDir();
+  const p2 = fakePhoto({ id: "j2", filename: "IMG.JPG", fileHandle: file2.handle, directoryHandle: dir2 });
+  installFakeApi([p2]);
+  await applyMetadata([p2], { artist: "Kim", iptc: { credit: "Wire" } }, { kind: "none" });
+  const t2 = getExifTiff(file2.state.bytes);
+  ok("creator still written in place", !!t2 && getAscii(parseTiff(t2, 0)?.ifd0, 0x013b) === "Kim");
+  ok("credit still goes to the sidecar", readXmp(dir2.files.get("IMG_jpg.xmp") ?? "").meta.iptc?.credit === "Wire");
+
+  const shared = fakeDir();
+  const a = fakePhoto({ id: "a", filename: "A.ARW", directoryHandle: shared });
+  const b = fakePhoto({ id: "b", filename: "B.ARW", directoryHandle: shared });
+  const fake = installFakeApi([a, b]);
+  await applyMetadata([a, b], { description: "{name} #{seq}", iptc: { headline: "{name}" } }, { kind: "none" });
+  ok(
+    "caption expanded per photo in the catalogue",
+    fake.state.photos[0].exif.imageDescription === "A #001" && fake.state.photos[1].exif.imageDescription === "B #002",
+  );
+  ok(
+    "headline expanded per sidecar",
+    readXmp(shared.files.get("A.xmp") ?? "").meta.iptc?.headline === "A" &&
+      readXmp(shared.files.get("B.xmp") ?? "").meta.iptc?.headline === "B",
+  );
+
+  const embedded = embedIptcInJpeg(
+    jpg,
+    upsertXmp(null, { meta: { iptc: { headline: "xmp head", credit: "xmp credit" } } }),
+    buildIim({ iptc: { headline: "iim head", credit: "iim credit", source: "iim source" } }),
+  );
+  const pm = fakePhoto({
+    filename: "PM.JPG",
+    fileHandle: fakeFile(embedded).handle,
+    directoryHandle: fakeDir({ "PM_jpg.xmp": upsertXmp(null, { meta: { iptc: { headline: "sidecar head" } } }) }),
+  });
+  const got = await readIptc(pm);
+  ok("sidecar wins", got.headline === "sidecar head");
+  ok("embedded XMP next", got.credit === "xmp credit");
+  ok("IIM last", got.source === "iim source");
+  const none = await readIptc(fakePhoto({ filename: "X.NEF", directoryHandle: fakeDir() }));
+  ok("RAW with no sidecar reads nothing", Object.keys(none).length === 0);
+}
+
+async function testExportEmbed(): Promise<void> {
+  console.log("Export embedding:");
+  const dir = fakeDir({ "DSC1.xmp": upsertXmp(null, { meta: { iptc: { headline: "Goal", credit: "Wire" } } }) });
+  const photo = fakePhoto({
+    filename: "DSC1.NEF",
+    directoryHandle: dir,
+    keywords: ["hockey"],
+    exif: { artist: "Jo", copyright: "© Jo", imageDescription: "Caption" },
+  });
+  const blob = new Blob([writeExifIntoJpeg(BARE_JPEG, cameraTiff(false))], { type: "image/jpeg" });
+  ok("off leaves the file alone", (await embedForExport(blob, photo, { embed: false, keywords: true })) === blob);
+
+  const on = new Uint8Array(await (await embedForExport(blob, photo, { embed: true, keywords: true })).arrayBuffer());
+  const emb = readEmbeddedMeta(on);
+  const x = readXmp(emb.xmp ?? "").meta;
+  ok("XMP carries sidecar IPTC", x.iptc?.headline === "Goal" && x.iptc?.credit === "Wire");
+  ok("XMP carries catalogue creator/copyright/caption", x.artist === "Jo" && x.copyright === "© Jo" && x.description === "Caption");
+  ok("XMP carries keywords", x.keywords?.[0] === "hockey");
+  const i = parseIim(emb.iim ?? new Uint8Array());
+  ok("IIM carries headline + by-line + keywords", i.iptc?.headline === "Goal" && i.artist === "Jo" && i.keywords?.[0] === "hockey");
+  ok("export EXIF kept", getExifTiff(on) !== null);
+
+  const noKw = readEmbeddedMeta(new Uint8Array(await (await embedForExport(blob, photo, { embed: true, keywords: false })).arrayBuffer()));
+  ok(
+    "keywords can be left out",
+    readXmp(noKw.xmp ?? "").meta.keywords === undefined && parseIim(noKw.iim ?? new Uint8Array()).keywords === undefined,
+  );
+  const png = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" });
+  ok("non-JPEG passes through", (await embedForExport(png, photo, { embed: true, keywords: true })) === png);
+  const bare = fakePhoto({ filename: "E.NEF", directoryHandle: fakeDir() });
+  ok("nothing to embed passes through", (await embedForExport(blob, bare, { embed: true, keywords: true })) === blob);
+}
+
 console.log("\nAdvanced EXIF Tools — verification\n");
 testTiffRoundtrip();
 testJpeg();
@@ -700,5 +971,12 @@ await testCatalogMerge();
 await testSidecarReadErrors();
 await testVirtualCopies();
 await testRenameRecovery();
+testIptcXmp();
+testIim();
+testJpegEmbed();
+testCaptionTokens();
+testTemplates();
+await testIptcApply();
+await testExportEmbed();
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) throw new Error(`${failed} checks failed`);

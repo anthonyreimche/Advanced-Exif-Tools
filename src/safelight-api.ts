@@ -131,6 +131,16 @@ export interface CatalogHooksContribution {
   }): Promise<Partial<CatalogPhoto> | void>;
 }
 
+/** The subset of core's ExportProcessorField this extension uses. */
+export type ExportProcessorField = { key: string; label: string; hint?: string; type: "boolean"; default: boolean };
+
+export interface ExportProcessorContribution {
+  id: string;
+  label: string;
+  settings?: ExportProcessorField[];
+  process?(blob: Blob, photo: CatalogPhoto, settings: Record<string, unknown>): Promise<Blob>;
+}
+
 export type SettingsField =
   | { key: string; label: string; hint?: string; type: "boolean"; default: boolean }
   | { key: string; label: string; hint?: string; type: "number"; default: number; min?: number; max?: number; step?: number }
@@ -247,6 +257,7 @@ export interface SafelightAPI {
   registerPanel(c: PanelContribution): void;
   registerGridMenuItem(c: GridMenuItemContribution): void;
   registerCatalogHooks(c: CatalogHooksContribution): void;
+  registerExportProcessor(c: ExportProcessorContribution): void;
   registerSettings(c: SettingsContribution): void;
   registerKeybinding(c: KeyActionContribution): void;
   settings: {

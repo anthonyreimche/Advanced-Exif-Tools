@@ -5,6 +5,7 @@ import { initRuntime } from "./rt";
 import type { SafelightAPI } from "./safelight-api";
 import { ToolsPanel, requestTab, type PanelTab } from "./Panel";
 import { readSidecarForImport } from "./metadata/apply";
+import { EXPORT_SETTINGS, embedForExport } from "./metadata/export";
 
 const ID = "anthonyreimche.advanced-exif-tools";
 const PANEL_ID = `${ID}.panel`;
@@ -47,5 +48,12 @@ export function activate(api: SafelightAPI): void {
   api.registerCatalogHooks({
     id: `${ID}.sidecar`,
     onPhotoImport: (ctx) => readSidecarForImport(ctx),
+  });
+
+  api.registerExportProcessor({
+    id: `${ID}.iptc`,
+    label: "IPTC metadata",
+    settings: EXPORT_SETTINGS,
+    process: (blob, photo, settings) => embedForExport(blob, photo, settings),
   });
 }

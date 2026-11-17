@@ -253,6 +253,18 @@ export function renderTemplate(
   return base;
 }
 
+/** Resolve the rename tokens in free text (a caption, a headline) for one photo
+ *  of a batch. Unlike renderTemplate, values are not made filename-safe and an
+ *  unknown {token} is kept as typed, so ordinary braces survive. {subsec} reads
+ *  nothing here and resolves to "". */
+export function expandTokens(text: string, photo: CatalogPhoto, index: number): string {
+  const ctx: Ctx = { photo, index, opts: DEFAULT_OPTIONS };
+  return text.replace(TOKEN_RE, (all: string, rawName: string, arg?: string) => {
+    const name = rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase();
+    return resolveToken(name, arg, ctx) ?? all;
+  });
+}
+
 /** Whether the template resolves {subsec} — the tab only harvests EXIF
  *  subseconds from files when it does. */
 export function templateUsesSubsec(template: string): boolean {
