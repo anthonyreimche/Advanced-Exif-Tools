@@ -5,13 +5,13 @@
 // copy would break hooks). `api` and `ui` are likewise stashed for non-component
 // code (engine + apply paths) to reach the scoped API without prop-drilling.
 
-import type { SafelightAPI, UiKit } from "./safelight-api";
+import type { SafelightAPI } from "./safelight";
 
 // Assigned in activate(). The non-null assertions are safe: nothing here runs
 // (no render, no engine call) until activate() has wired them up.
 export let React!: typeof import("react");
 export let api!: SafelightAPI;
-export let ui!: UiKit;
+export let ui!: SafelightAPI["ui"];
 
 export function initRuntime(a: SafelightAPI): void {
   api = a;

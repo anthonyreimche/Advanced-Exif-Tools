@@ -4,7 +4,7 @@
 // active photo.
 
 import { React, api, ui } from "../rt";
-import { useSelectedPhotos, Hint, Notice } from "../ui";
+import { Status, Notice } from "../ui";
 import { type EditableMeta, type DateOp, formatExifDate, currentMeta } from "./model";
 import { applyMetadata, readIptc, type WriteResult } from "./apply";
 import { readAllTags, type DumpEntry } from "./exif-read";
@@ -28,9 +28,11 @@ function toExifDate(s: string): string | null {
 
 const READ_LIMIT = 1 << 20; // EXIF/IFD0 sit near the file start
 
+const TOKENS_TIP = "Text fields take the rename tokens, filled in for each photo: {date}, {yyyy}, {mon}, {day}, {name}, {seq}, {folder}, {make}, {model}, {lens}…";
+
 export function MetadataTab(): React.ReactElement {
   const { Button, TextInput, TextArea, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, Toggle, tokens } = ui;
-  const targets = useSelectedPhotos();
+  const targets = api.catalog.useTargetPhotos();
   const single = targets.length === 1;
   const firstId = targets[0]?.id;
 
@@ -222,39 +224,42 @@ export function MetadataTab(): React.ReactElement {
     <Stack gap={12}>
       <Section title={targets.length > 1 ? `Edit metadata (${targets.length} photos)` : "Edit metadata"}>
         <Stack gap={8}>
-          {targets.length === 0 && <Hint>Select one or more photos in the grid.</Hint>}
-          {targets.length > 1 && <Hint>Only the fields you change are written. Empty a field to clear it.</Hint>}
+          {targets.length === 0 && <Status>Select one or more photos in the grid.</Status>}
 
-          <Field label="Creator">
-            <TextInput value={values.artist} onChange={(v) => setField("artist", v)} placeholder={keep} />
-          </Field>
-          <Field label="Copyright">
-            <TextInput value={values.copyright} onChange={(v) => setField("copyright", v)} placeholder={keep} />
-          </Field>
-          <Field label="Caption / description">
-            <TextArea value={values.description} onChange={(v) => setField("description", v)} rows={2} placeholder={keep} />
-          </Field>
-          <Field label="Keywords" hint="Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files.">
-            <TextArea value={values.keywords} onChange={(v) => setField("keywords", v)} rows={2} placeholder={single ? "sunset, coast" : keep} />
-          </Field>
-
-          <Field label="IPTC" hint="Kept in the .xmp sidecar for every format; the original file is never changed for these.">
+          <div title={TOKENS_TIP}>
             <Stack gap={8}>
-              <SegmentedControl
-                value={group}
-                onChange={(v) => setGroup(v as IptcGroup)}
-                options={IPTC_GROUPS.map((g) => ({ value: g.value, label: groupTouched(g.value) ? `${g.label} •` : g.label }))}
-              />
-              {IPTC_FIELDS.filter((f) => f.group === group).map((f) => (
-                <Field key={f.key} label={f.label}>{iptcInput(f)}</Field>
-              ))}
-              {iptcErr && <Notice tone="warn">{iptcErr}</Notice>}
+              <Field label="Creator">
+                <TextInput value={values.artist} onChange={(v) => setField("artist", v)} placeholder={keep} />
+              </Field>
+              <Field label="Copyright">
+                <TextInput value={values.copyright} onChange={(v) => setField("copyright", v)} placeholder={keep} />
+              </Field>
+              <Field label="Caption / description">
+                <TextArea value={values.description} onChange={(v) => setField("description", v)} rows={2} placeholder={keep} />
+              </Field>
             </Stack>
-          </Field>
-          <Hint>
-            Text fields take the rename tokens, filled in for each photo: {"{date}"}, {"{yyyy}"}, {"{mon}"}, {"{day}"}, {"{name}"},
-            {" {seq}"}, {"{folder}"}, {"{make}"}, {"{model}"}, {"{lens}"}…
-          </Hint>
+          </div>
+          <div title="Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files.">
+            <Field label="Keywords">
+              <TextArea value={values.keywords} onChange={(v) => setField("keywords", v)} rows={2} placeholder={single ? "sunset, coast" : keep} />
+            </Field>
+          </div>
+
+          <div title={`Kept in the .xmp sidecar for every format; the original file is never changed for these. ${TOKENS_TIP}`}>
+            <Field label="IPTC">
+              <Stack gap={8}>
+                <SegmentedControl
+                  value={group}
+                  onChange={(v) => setGroup(v as IptcGroup)}
+                  options={IPTC_GROUPS.map((g) => ({ value: g.value, label: groupTouched(g.value) ? `${g.label} •` : g.label }))}
+                />
+                {IPTC_FIELDS.filter((f) => f.group === group).map((f) => (
+                  <Field key={f.key} label={f.label}>{iptcInput(f)}</Field>
+                ))}
+                {iptcErr && <Notice tone="warn">{iptcErr}</Notice>}
+              </Stack>
+            </Field>
+          </div>
 
           <Field label="Capture time">
             <Stack gap={6}>
@@ -273,8 +278,8 @@ export function MetadataTab(): React.ReactElement {
               {dateMode === "set" && dateInvalid && <Notice tone="danger">Use the form YYYY:MM:DD HH:MM:SS.</Notice>}
               {dateMode === "shift" && (
                 <Row gap={10}>
-                  <Field label="Hours"><NumberInput value={shiftH} onChange={setShiftH} min={-72} max={72} step={1} width={64} /></Field>
-                  <Field label="Minutes"><NumberInput value={shiftM} onChange={setShiftM} min={-59} max={59} step={1} width={64} /></Field>
+                  <Field label="Hours"><NumberInput value={shiftH} onChange={setShiftH} min={-72} max={72} step={1} width="64px" /></Field>
+                  <Field label="Minutes"><NumberInput value={shiftM} onChange={setShiftM} min={-59} max={59} step={1} width="64px" /></Field>
                 </Row>
               )}
             </Stack>
@@ -285,8 +290,8 @@ export function MetadataTab(): React.ReactElement {
               <Toggle checked={gpsOn} onChange={setGpsOn} label="Set coordinates" />
               {gpsOn && (
                 <Row gap={10}>
-                  <Field label="Latitude"><NumberInput value={lat} onChange={setLat} min={-90} max={90} step={0.0001} width={100} /></Field>
-                  <Field label="Longitude"><NumberInput value={lon} onChange={setLon} min={-180} max={180} step={0.0001} width={100} /></Field>
+                  <Field label="Latitude"><NumberInput value={lat} onChange={setLat} min={-90} max={90} step={0.0001} width="100px" /></Field>
+                  <Field label="Longitude"><NumberInput value={lon} onChange={setLon} min={-180} max={180} step={0.0001} width="100px" /></Field>
                 </Row>
               )}
             </Stack>
@@ -303,7 +308,7 @@ export function MetadataTab(): React.ReactElement {
             </Notice>
           )}
 
-          <Button variant="primary" full disabled={!canApply} onClick={run}>
+          <Button variant="primary" full disabled={!canApply} onClick={run} title={targets.length > 1 ? "Only the fields you change are written. Empty a field to clear it." : undefined}>
             {applying ? "Writing…" : `Apply to ${targets.length || ""} photo${targets.length === 1 ? "" : "s"}`}
           </Button>
         </Stack>
@@ -311,13 +316,15 @@ export function MetadataTab(): React.ReactElement {
 
       <Section title="Templates">
         <Stack gap={6}>
-          <Select
-            value=""
-            onChange={loadTemplate}
-            placeholder={templates.length ? "Fill in from a template…" : "No templates yet"}
-            disabled={templates.length === 0}
-            options={templates.map((t) => ({ value: t.name, label: t.name }))}
-          />
+          <div title="A template fills in its fields; Apply writes them. Tokens such as {date} stay tokens until then.">
+            <Select
+              value=""
+              onChange={loadTemplate}
+              placeholder={templates.length ? "Fill in from a template…" : "No templates yet"}
+              disabled={templates.length === 0}
+              options={templates.map((t) => ({ value: t.name, label: t.name }))}
+            />
+          </div>
           <Row gap={6}>
             <div style={{ flex: 1 }}>
               <TextInput value={templateName} onChange={setTemplateName} placeholder="Save filled-in fields as…" />
@@ -329,15 +336,14 @@ export function MetadataTab(): React.ReactElement {
               <Button size="sm" variant="danger" onClick={deleteTemplate}>Delete</Button>
             )}
           </Row>
-          <Hint>A template fills in its fields; Apply writes them. Tokens such as {"{date}"} stay tokens until then.</Hint>
         </Stack>
       </Section>
 
       <Section title={single ? "Inspector" : "Inspector (first selected)"}>
-        {targets.length === 0 && <Hint>Nothing selected.</Hint>}
+        {targets.length === 0 && <Status>Nothing selected.</Status>}
         {targets.length > 0 && dumpErr && <Notice tone="warn">{dumpErr}</Notice>}
-        {targets.length > 0 && !dumpErr && dump === null && <Hint>Reading…</Hint>}
-        {dump !== null && dump.length === 0 && <Hint>No EXIF metadata found in this file.</Hint>}
+        {targets.length > 0 && !dumpErr && dump === null && <Status>Reading…</Status>}
+        {dump !== null && dump.length === 0 && <Status>No EXIF metadata found in this file.</Status>}
         {dump !== null && dump.length > 0 && <TagDump rows={dump} />}
       </Section>
     </Stack>

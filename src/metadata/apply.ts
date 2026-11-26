@@ -5,7 +5,7 @@
 // to a safe sidecar rather than a damaged original.
 
 import { api } from "../rt";
-import type { CatalogPhoto } from "../safelight-api";
+import type { CatalogPhoto } from "../safelight";
 import { type EditableMeta, type DateOp, resolveDate, decimalToDms, expandEdits } from "./model";
 import {
   parseTiff, serializeTiff, setAscii, getAscii, ensureExif, ensureGps, setRationals,

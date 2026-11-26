@@ -1,9 +1,11 @@
-// Rename engine — pure, API-free. Turns a filename template plus per-batch
-// numbering options into concrete new base names, and plans a collision-safe
-// application order. The actual on-disk rename runs through core's atomic
-// api.catalog.renamePhoto (see apply.ts); this module never touches files.
+// Rename engine. Turns a filename template plus per-batch numbering options into
+// concrete new base names (the tokens themselves are Safelight's shared naming
+// seam, api.naming) and plans a collision-safe application order. The actual
+// on-disk rename runs through core's atomic api.catalog.renamePhoto (see
+// apply.ts); this module never touches files.
 
-import type { CatalogPhoto } from "../safelight-api";
+import { api } from "../rt";
+import type { CatalogPhoto, NameOptions, NameSubject } from "../safelight";
 
 export type CaseMode = "asis" | "lower" | "upper";
 
@@ -28,74 +30,7 @@ export const DEFAULT_OPTIONS: RenameOptions = {
   caseMode: "asis",
 };
 
-/** Palette entries for the "insert token" UI. `insert` is the exact text
- *  dropped into the template; `sample` is shown as a hint. */
-export interface TokenInfo {
-  insert: string;
-  label: string;
-  sample: string;
-}
-
-export const TOKEN_GROUPS: { group: string; tokens: TokenInfo[] }[] = [
-  {
-    group: "Naming",
-    tokens: [
-      { insert: "{name}", label: "Original name", sample: "IMG_1234" },
-      { insert: "{seq}", label: "Sequence number", sample: "001" },
-      { insert: "{seq:4}", label: "Sequence (width 4)", sample: "0001" },
-      { insert: "{letter}", label: "Sequence letter", sample: "a" },
-      { insert: "{LETTER}", label: "Sequence letter (caps)", sample: "A" },
-      { insert: "{folder}", label: "Folder name", sample: "Trip" },
-      { insert: "{ext}", label: "Extension", sample: "nef" },
-    ],
-  },
-  {
-    group: "Capture date",
-    tokens: [
-      { insert: "{yyyy}", label: "Year (4)", sample: "2026" },
-      { insert: "{yy}", label: "Year (2)", sample: "26" },
-      { insert: "{mon}", label: "Month", sample: "06" },
-      { insert: "{day}", label: "Day", sample: "30" },
-      { insert: "{hour}", label: "Hour (24h)", sample: "14" },
-      { insert: "{min}", label: "Minute", sample: "05" },
-      { insert: "{sec}", label: "Second", sample: "42" },
-      { insert: "{subsec}", label: "Subseconds (ms)", sample: "541" },
-      { insert: "{date}", label: "Date (yyyymmdd)", sample: "20260630" },
-      { insert: "{time}", label: "Time (hhmmss)", sample: "140542" },
-    ],
-  },
-  {
-    group: "Camera & EXIF",
-    tokens: [
-      { insert: "{make}", label: "Camera make", sample: "NIKON" },
-      { insert: "{model}", label: "Camera model", sample: "Z8" },
-      { insert: "{lens}", label: "Lens", sample: "24-70mm" },
-      { insert: "{iso}", label: "ISO", sample: "400" },
-      { insert: "{fnum}", label: "Aperture", sample: "f2.8" },
-      { insert: "{shutter}", label: "Shutter", sample: "1_250" },
-      { insert: "{focal}", label: "Focal length", sample: "35mm" },
-    ],
-  },
-];
-
-/** Every recognized bare token id (without args), for validation. */
-const KNOWN_TOKENS = new Set<string>([
-  "name", "seq", "letter", "folder", "ext",
-  "yyyy", "yy", "mon", "day", "hour", "min", "sec", "subsec", "date", "time",
-  "make", "model", "lens", "iso", "fnum", "shutter", "focal",
-]);
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/** Characters no mainstream filesystem accepts. Replaced with "_" inside a
- *  resolved token value so e.g. a "1/250" shutter is safe. Legal-but-cosmetic
- *  chars (space, hyphen, dot) are deliberately preserved so a user's literal
- *  separators survive; core's rename also strips any stray "/" or "\". */
-const ILLEGAL = /[<>:"/\\|?*]/g;
-
-function sanitizeValue(v: string): string {
-  return v.replace(ILLEGAL, "_").trim();
-}
+const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
 
 function splitExt(filename: string): { base: string; ext: string } {
   const i = filename.lastIndexOf(".");
@@ -104,165 +39,44 @@ function splitExt(filename: string): { base: string; ext: string } {
     : { base: filename, ext: "" };
 }
 
-function pad(n: number, width: number): string {
-  const s = Math.trunc(Math.abs(n)).toString();
-  const signed = n < 0 ? "-" : "";
-  return signed + (s.length >= width ? s : "0".repeat(width - s.length) + s);
+/** What core's naming reads from a photo. `subsecById` holds the EXIF
+ *  subsecond digits harvested from the files (see rename/subsec.ts); the
+ *  catalogue's own value is the fallback. */
+function subjectOf(photo: CatalogPhoto, subsecById?: ReadonlyMap<string, string>): NameSubject {
+  const subsec = subsecById?.get(photo.id) || photo.exif.subSecTimeOriginal;
+  return {
+    filename: photo.filename,
+    exif: subsec ? { ...photo.exif, subSecTimeOriginal: subsec } : photo.exif,
+    dateCreated: photo.dateCreated,
+    folderName: photo.directoryHandle?.name || (photo.folder ? photo.folder.split("/").pop() ?? "" : ""),
+  };
 }
 
-/** Spreadsheet-style base-26 lettering: 0→a, 25→z, 26→aa, 27→ab … */
-function seqLetter(index: number): string {
-  let n = Math.max(0, Math.trunc(index));
-  let out = "";
-  do {
-    out = String.fromCharCode(97 + (n % 26)) + out;
-    n = Math.floor(n / 26) - 1;
-  } while (n >= 0);
-  return out;
+function nameOptions(index: number, opts: RenameOptions): NameOptions {
+  return {
+    index,
+    seqStart: opts.seqStart,
+    seqStep: opts.seqStep,
+    seqPad: opts.seqPad,
+    caseMode: opts.caseMode,
+  };
 }
 
-/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalogue's
- *  dateCreated. Returns null when neither is usable (date tokens → ""). */
-function captureDate(photo: CatalogPhoto): Date | null {
-  const raw = photo.exif.dateTimeOriginal;
-  if (raw) {
-    const m = raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
-    if (m) {
-      const [, y, mo, d, h, mi, s] = m;
-      const dt = new Date(+y, +mo - 1, +d, +h, +mi, +s);
-      if (!Number.isNaN(dt.getTime())) return dt;
-    }
-  }
-  if (photo.dateCreated) {
-    const dt = new Date(photo.dateCreated);
-    if (!Number.isNaN(dt.getTime())) return dt;
-  }
-  return null;
-}
-
-// ── token resolution ─────────────────────────────────────────────────────────
-
-interface Ctx {
-  photo: CatalogPhoto;
-  index: number;
-  opts: RenameOptions;
-  /** EXIF subsecond digit strings by photo id (see rename/subsec.ts). */
-  subsec?: ReadonlyMap<string, string>;
-}
-
-/** Resolve one token (already split into name + optional arg). Returns the raw
- *  (un-sanitized) replacement, or null for an unknown token. */
-function resolveToken(name: string, arg: string | undefined, ctx: Ctx): string | null {
-  const { photo, index, opts } = ctx;
-  const exif = photo.exif;
-  const date = captureDate(photo);
-  const two = (n: number) => pad(n, 2);
-
-  switch (name) {
-    case "name":
-      return splitExt(photo.filename).base;
-    case "ext":
-      return splitExt(photo.filename).ext;
-    case "folder":
-      // The containing folder's own name. For a photo at the project root
-      // photo.folder is "" — fall back to the directory handle, whose name is
-      // the project folder itself, so top-level images still get a value.
-      return photo.directoryHandle?.name || (photo.folder ? photo.folder.split("/").pop() ?? "" : "");
-    case "seq": {
-      const width = arg && /^\d+$/.test(arg) ? +arg : opts.seqPad;
-      return pad(opts.seqStart + index * opts.seqStep, width);
-    }
-    case "letter":
-      return seqLetter(index);
-    case "LETTER":
-      return seqLetter(index).toUpperCase();
-    case "yyyy":
-      return date ? String(date.getFullYear()) : "";
-    case "yy":
-      return date ? two(date.getFullYear() % 100) : "";
-    case "mon":
-      return date ? two(date.getMonth() + 1) : "";
-    case "day":
-      return date ? two(date.getDate()) : "";
-    case "hour":
-      return date ? two(date.getHours()) : "";
-    case "min":
-      return date ? two(date.getMinutes()) : "";
-    case "sec":
-      return date ? two(date.getSeconds()) : "";
-    case "subsec": {
-      // EXIF SubSecTime* is the decimal fraction as a digit string ("5" = .5s),
-      // so a fixed width needs right-padding, not left: default 3 = milliseconds.
-      const digits = (ctx.subsec?.get(photo.id) ?? "").replace(/\D/g, "");
-      if (!digits) return "";
-      const width = arg && /^\d+$/.test(arg) ? Math.max(1, +arg) : 3;
-      return digits.slice(0, width).padEnd(width, "0");
-    }
-    case "date":
-      return date
-        ? `${date.getFullYear()}${two(date.getMonth() + 1)}${two(date.getDate())}`
-        : "";
-    case "time":
-      return date
-        ? `${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}`
-        : "";
-    case "make":
-      return exif.cameraMake ?? "";
-    case "model":
-      return exif.cameraModel ?? "";
-    case "lens":
-      return exif.lens ?? "";
-    case "iso":
-      return exif.iso != null ? String(exif.iso) : "";
-    case "fnum":
-      return exif.aperture != null ? `f${exif.aperture}` : "";
-    case "shutter":
-      return exif.shutterSpeed ?? "";
-    case "focal":
-      return exif.focalLength != null ? `${exif.focalLength}mm` : "";
-    default:
-      return null;
-  }
-}
-
-const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
-
-/** Render a template for one photo into a sanitized base name (no extension).
- *  `letter`/`LETTER` are case-sensitive; all other token names are matched
- *  case-insensitively. Unknown tokens resolve to "" (and are surfaced by
- *  collectUnknownTokens for a warning). */
+/** Render a template for one photo into a sanitized base name (no extension). */
 export function renderTemplate(
   photo: CatalogPhoto,
   index: number,
   opts: RenameOptions,
   subsecById?: ReadonlyMap<string, string>,
 ): string {
-  const ctx: Ctx = { photo, index, opts, subsec: subsecById };
-  const out = opts.template.replace(TOKEN_RE, (_all, rawName: string, arg?: string) => {
-    const name = rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase();
-    const val = resolveToken(name, arg, ctx);
-    return val == null ? "" : sanitizeValue(val);
-  });
-  // Sanitize the whole assembly too (literal text may carry illegal chars) and
-  // collapse any runs of separators the empty tokens left behind.
-  let base = sanitizeValue(out)
-    .replace(/[ _-]{2,}/g, (m) => m[0]) // an empty token often leaves a doubled separator
-    .replace(/^[-_. ]+|[-_. ]+$/g, ""); // no leading/trailing separators or dots
-  if (opts.caseMode === "lower") base = base.toLowerCase();
-  else if (opts.caseMode === "upper") base = base.toUpperCase();
-  return base;
+  return api.naming.render(opts.template, subjectOf(photo, subsecById), nameOptions(index, opts));
 }
 
 /** Resolve the rename tokens in free text (a caption, a headline) for one photo
- *  of a batch. Unlike renderTemplate, values are not made filename-safe and an
- *  unknown {token} is kept as typed, so ordinary braces survive. {subsec} reads
- *  nothing here and resolves to "". */
+ *  of a batch. Values are not made filename-safe and an unknown {token} is kept
+ *  as typed, so ordinary braces survive. */
 export function expandTokens(text: string, photo: CatalogPhoto, index: number): string {
-  const ctx: Ctx = { photo, index, opts: DEFAULT_OPTIONS };
-  return text.replace(TOKEN_RE, (all: string, rawName: string, arg?: string) => {
-    const name = rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase();
-    return resolveToken(name, arg, ctx) ?? all;
-  });
+  return api.naming.expand(text, subjectOf(photo), { index });
 }
 
 /** Whether the template resolves {subsec} — the tab only harvests EXIF
@@ -272,17 +86,6 @@ export function templateUsesSubsec(template: string): boolean {
     if (m[1].toLowerCase() === "subsec") return true;
   }
   return false;
-}
-
-/** Token ids present in the template that aren't recognized — for a live
- *  "unknown token" hint. `letter`/`LETTER` both fold to the known "letter". */
-export function collectUnknownTokens(template: string): string[] {
-  const seen = new Set<string>();
-  for (const m of template.matchAll(TOKEN_RE)) {
-    const id = m[1].toLowerCase();
-    if (!KNOWN_TOKENS.has(id)) seen.add(m[1]);
-  }
-  return [...seen];
 }
 
 // ── planning ─────────────────────────────────────────────────────────────────
@@ -367,6 +170,6 @@ export function planRename(
     items,
     duplicates: [...new Set(duplicates)],
     needsTempPass,
-    unknownTokens: collectUnknownTokens(opts.template),
+    unknownTokens: api.naming.unknownTokens(opts.template),
   };
 }

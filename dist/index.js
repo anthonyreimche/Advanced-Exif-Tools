@@ -10,28 +10,8 @@ function initRuntime(a) {
 
 //#endregion
 //#region src/ui.tsx
-/** The photos a batch action targets: the current multi-selection, or the
-*  single active photo when nothing is multi-selected. Grid order is preserved
-*  (we filter `photos`, not the id set). Re-renders on any selection change. */
-function useSelectedPhotos() {
-	const photos = api.stores.useCatalogStore((s) => s.photos);
-	const selectedIds = api.stores.useCatalogStore((s) => s.selectedIds);
-	const activeId = api.stores.useCatalogStore((s) => s.activePhotoId);
-	return React.useMemo(() => {
-		if (selectedIds.size > 0) return photos.filter((p) => selectedIds.has(p.id));
-		if (activeId) {
-			const a = photos.find((p) => p.id === activeId);
-			return a ? [a] : [];
-		}
-		return [];
-	}, [
-		photos,
-		selectedIds,
-		activeId
-	]);
-}
-/** A muted line of helper text. */
-function Hint({ children }) {
+/** A muted status line: what the panel is waiting for or what it skipped. */
+function Status({ children }) {
 	return /* @__PURE__ */ React.createElement("div", { style: {
 		color: ui.tokens.textMuted,
 		fontSize: 11,
@@ -41,7 +21,7 @@ function Hint({ children }) {
 /** A small inline notice used for warnings and result summaries. `tone` picks
 *  the accent colour without inventing new tokens. */
 function Notice({ tone = "info", children }) {
-	const color = tone === "warn" ? "var(--color-rating)" : tone === "danger" ? "#e5484d" : tone === "ok" ? "#46a758" : ui.tokens.textSecondary;
+	const color = tone === "warn" ? ui.tokens.rating : tone === "danger" ? ui.tokens.labelRed : tone === "ok" ? ui.tokens.labelGreen : ui.tokens.textSecondary;
 	return /* @__PURE__ */ React.createElement("div", { style: {
 		borderLeft: `2px solid ${color}`,
 		paddingLeft: 8,
@@ -60,176 +40,7 @@ const DEFAULT_OPTIONS = {
 	seqPad: 3,
 	caseMode: "asis"
 };
-const TOKEN_GROUPS = [
-	{
-		group: "Naming",
-		tokens: [
-			{
-				insert: "{name}",
-				label: "Original name",
-				sample: "IMG_1234"
-			},
-			{
-				insert: "{seq}",
-				label: "Sequence number",
-				sample: "001"
-			},
-			{
-				insert: "{seq:4}",
-				label: "Sequence (width 4)",
-				sample: "0001"
-			},
-			{
-				insert: "{letter}",
-				label: "Sequence letter",
-				sample: "a"
-			},
-			{
-				insert: "{LETTER}",
-				label: "Sequence letter (caps)",
-				sample: "A"
-			},
-			{
-				insert: "{folder}",
-				label: "Folder name",
-				sample: "Trip"
-			},
-			{
-				insert: "{ext}",
-				label: "Extension",
-				sample: "nef"
-			}
-		]
-	},
-	{
-		group: "Capture date",
-		tokens: [
-			{
-				insert: "{yyyy}",
-				label: "Year (4)",
-				sample: "2026"
-			},
-			{
-				insert: "{yy}",
-				label: "Year (2)",
-				sample: "26"
-			},
-			{
-				insert: "{mon}",
-				label: "Month",
-				sample: "06"
-			},
-			{
-				insert: "{day}",
-				label: "Day",
-				sample: "30"
-			},
-			{
-				insert: "{hour}",
-				label: "Hour (24h)",
-				sample: "14"
-			},
-			{
-				insert: "{min}",
-				label: "Minute",
-				sample: "05"
-			},
-			{
-				insert: "{sec}",
-				label: "Second",
-				sample: "42"
-			},
-			{
-				insert: "{subsec}",
-				label: "Subseconds (ms)",
-				sample: "541"
-			},
-			{
-				insert: "{date}",
-				label: "Date (yyyymmdd)",
-				sample: "20260630"
-			},
-			{
-				insert: "{time}",
-				label: "Time (hhmmss)",
-				sample: "140542"
-			}
-		]
-	},
-	{
-		group: "Camera & EXIF",
-		tokens: [
-			{
-				insert: "{make}",
-				label: "Camera make",
-				sample: "NIKON"
-			},
-			{
-				insert: "{model}",
-				label: "Camera model",
-				sample: "Z8"
-			},
-			{
-				insert: "{lens}",
-				label: "Lens",
-				sample: "24-70mm"
-			},
-			{
-				insert: "{iso}",
-				label: "ISO",
-				sample: "400"
-			},
-			{
-				insert: "{fnum}",
-				label: "Aperture",
-				sample: "f2.8"
-			},
-			{
-				insert: "{shutter}",
-				label: "Shutter",
-				sample: "1_250"
-			},
-			{
-				insert: "{focal}",
-				label: "Focal length",
-				sample: "35mm"
-			}
-		]
-	}
-];
-/** Every recognized bare token id (without args), for validation. */
-const KNOWN_TOKENS = /* @__PURE__ */ new Set([
-	"name",
-	"seq",
-	"letter",
-	"folder",
-	"ext",
-	"yyyy",
-	"yy",
-	"mon",
-	"day",
-	"hour",
-	"min",
-	"sec",
-	"subsec",
-	"date",
-	"time",
-	"make",
-	"model",
-	"lens",
-	"iso",
-	"fnum",
-	"shutter",
-	"focal"
-]);
-/** Characters no mainstream filesystem accepts. Replaced with "_" inside a
-*  resolved token value so e.g. a "1/250" shutter is safe. Legal-but-cosmetic
-*  chars (space, hyphen, dot) are deliberately preserved so a user's literal
-*  separators survive; core's rename also strips any stray "/" or "\". */
-const ILLEGAL = /[<>:"/\\|?*]/g;
-function sanitizeValue(v) {
-	return v.replace(ILLEGAL, "_").trim();
-}
+const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
 function splitExt(filename) {
 	const i = filename.lastIndexOf(".");
 	return i > 0 ? {
@@ -240,129 +51,45 @@ function splitExt(filename) {
 		ext: ""
 	};
 }
-function pad(n, width) {
-	const s = Math.trunc(Math.abs(n)).toString();
-	return (n < 0 ? "-" : "") + (s.length >= width ? s : "0".repeat(width - s.length) + s);
-}
-/** Spreadsheet-style base-26 lettering: 0→a, 25→z, 26→aa, 27→ab … */
-function seqLetter(index) {
-	let n = Math.max(0, Math.trunc(index));
-	let out = "";
-	do {
-		out = String.fromCharCode(97 + n % 26) + out;
-		n = Math.floor(n / 26) - 1;
-	} while (n >= 0);
-	return out;
-}
-/** Capture moment for date tokens: EXIF DateTimeOriginal, else the catalogue's
-*  dateCreated. Returns null when neither is usable (date tokens → ""). */
-function captureDate(photo) {
-	const raw = photo.exif.dateTimeOriginal;
-	if (raw) {
-		const m = raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
-		if (m) {
-			const [, y, mo, d, h, mi, s] = m;
-			const dt = new Date(+y, +mo - 1, +d, +h, +mi, +s);
-			if (!Number.isNaN(dt.getTime())) return dt;
-		}
-	}
-	if (photo.dateCreated) {
-		const dt = new Date(photo.dateCreated);
-		if (!Number.isNaN(dt.getTime())) return dt;
-	}
-	return null;
-}
-/** Resolve one token (already split into name + optional arg). Returns the raw
-*  (un-sanitized) replacement, or null for an unknown token. */
-function resolveToken(name, arg, ctx) {
-	const { photo, index, opts } = ctx;
-	const exif = photo.exif;
-	const date = captureDate(photo);
-	const two = (n) => pad(n, 2);
-	switch (name) {
-		case "name": return splitExt(photo.filename).base;
-		case "ext": return splitExt(photo.filename).ext;
-		case "folder": return photo.directoryHandle?.name || (photo.folder ? photo.folder.split("/").pop() ?? "" : "");
-		case "seq": {
-			const width = arg && /^\d+$/.test(arg) ? +arg : opts.seqPad;
-			return pad(opts.seqStart + index * opts.seqStep, width);
-		}
-		case "letter": return seqLetter(index);
-		case "LETTER": return seqLetter(index).toUpperCase();
-		case "yyyy": return date ? String(date.getFullYear()) : "";
-		case "yy": return date ? two(date.getFullYear() % 100) : "";
-		case "mon": return date ? two(date.getMonth() + 1) : "";
-		case "day": return date ? two(date.getDate()) : "";
-		case "hour": return date ? two(date.getHours()) : "";
-		case "min": return date ? two(date.getMinutes()) : "";
-		case "sec": return date ? two(date.getSeconds()) : "";
-		case "subsec": {
-			const digits = (ctx.subsec?.get(photo.id) ?? "").replace(/\D/g, "");
-			if (!digits) return "";
-			const width = arg && /^\d+$/.test(arg) ? Math.max(1, +arg) : 3;
-			return digits.slice(0, width).padEnd(width, "0");
-		}
-		case "date": return date ? `${date.getFullYear()}${two(date.getMonth() + 1)}${two(date.getDate())}` : "";
-		case "time": return date ? `${two(date.getHours())}${two(date.getMinutes())}${two(date.getSeconds())}` : "";
-		case "make": return exif.cameraMake ?? "";
-		case "model": return exif.cameraModel ?? "";
-		case "lens": return exif.lens ?? "";
-		case "iso": return exif.iso != null ? String(exif.iso) : "";
-		case "fnum": return exif.aperture != null ? `f${exif.aperture}` : "";
-		case "shutter": return exif.shutterSpeed ?? "";
-		case "focal": return exif.focalLength != null ? `${exif.focalLength}mm` : "";
-		default: return null;
-	}
-}
-const TOKEN_RE = /\{([A-Za-z]+)(?::([^}]*))?\}/g;
-/** Render a template for one photo into a sanitized base name (no extension).
-*  `letter`/`LETTER` are case-sensitive; all other token names are matched
-*  case-insensitively. Unknown tokens resolve to "" (and are surfaced by
-*  collectUnknownTokens for a warning). */
-function renderTemplate(photo, index, opts, subsecById) {
-	const ctx = {
-		photo,
-		index,
-		opts,
-		subsec: subsecById
+/** What core's naming reads from a photo. `subsecById` holds the EXIF
+*  subsecond digits harvested from the files (see rename/subsec.ts); the
+*  catalogue's own value is the fallback. */
+function subjectOf(photo, subsecById) {
+	const subsec = subsecById?.get(photo.id) || photo.exif.subSecTimeOriginal;
+	return {
+		filename: photo.filename,
+		exif: subsec ? {
+			...photo.exif,
+			subSecTimeOriginal: subsec
+		} : photo.exif,
+		dateCreated: photo.dateCreated,
+		folderName: photo.directoryHandle?.name || (photo.folder ? photo.folder.split("/").pop() ?? "" : "")
 	};
-	let base = sanitizeValue(opts.template.replace(TOKEN_RE, (_all, rawName, arg) => {
-		const val = resolveToken(rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase(), arg, ctx);
-		return val == null ? "" : sanitizeValue(val);
-	})).replace(/[ _-]{2,}/g, (m) => m[0]).replace(/^[-_. ]+|[-_. ]+$/g, "");
-	if (opts.caseMode === "lower") base = base.toLowerCase();
-	else if (opts.caseMode === "upper") base = base.toUpperCase();
-	return base;
+}
+function nameOptions(index, opts) {
+	return {
+		index,
+		seqStart: opts.seqStart,
+		seqStep: opts.seqStep,
+		seqPad: opts.seqPad,
+		caseMode: opts.caseMode
+	};
+}
+/** Render a template for one photo into a sanitized base name (no extension). */
+function renderTemplate(photo, index, opts, subsecById) {
+	return api.naming.render(opts.template, subjectOf(photo, subsecById), nameOptions(index, opts));
 }
 /** Resolve the rename tokens in free text (a caption, a headline) for one photo
-*  of a batch. Unlike renderTemplate, values are not made filename-safe and an
-*  unknown {token} is kept as typed, so ordinary braces survive. {subsec} reads
-*  nothing here and resolves to "". */
+*  of a batch. Values are not made filename-safe and an unknown {token} is kept
+*  as typed, so ordinary braces survive. */
 function expandTokens(text, photo, index) {
-	const ctx = {
-		photo,
-		index,
-		opts: DEFAULT_OPTIONS
-	};
-	return text.replace(TOKEN_RE, (all, rawName, arg) => {
-		return resolveToken(rawName === "LETTER" ? "LETTER" : rawName === "letter" ? "letter" : rawName.toLowerCase(), arg, ctx) ?? all;
-	});
+	return api.naming.expand(text, subjectOf(photo), { index });
 }
 /** Whether the template resolves {subsec} — the tab only harvests EXIF
 *  subseconds from files when it does. */
 function templateUsesSubsec(template) {
 	for (const m of template.matchAll(TOKEN_RE)) if (m[1].toLowerCase() === "subsec") return true;
 	return false;
-}
-/** Token ids present in the template that aren't recognized — for a live
-*  "unknown token" hint. `letter`/`LETTER` both fold to the known "letter". */
-function collectUnknownTokens(template) {
-	const seen = /* @__PURE__ */ new Set();
-	for (const m of template.matchAll(TOKEN_RE)) {
-		const id = m[1].toLowerCase();
-		if (!KNOWN_TOKENS.has(id)) seen.add(m[1]);
-	}
-	return [...seen];
 }
 /** Build a rename plan for `targets` (already in the intended order). Detects
 *  in-batch duplicate names and whether a temp pass is required to dodge
@@ -408,7 +135,7 @@ function planRename(targets, opts, subsecById) {
 		items,
 		duplicates: [...new Set(duplicates)],
 		needsTempPass,
-		unknownTokens: collectUnknownTokens(opts.template)
+		unknownTokens: api.naming.unknownTokens(opts.template)
 	};
 }
 
@@ -1168,7 +895,7 @@ const PRESETS_KEY = "rename.presets";
 const PREVIEW_LIMIT = 8;
 function RenameTab() {
 	const { Button, TextInput, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, tokens } = ui;
-	const targets = useSelectedPhotos();
+	const targets = api.catalog.useTargetPhotos();
 	const [opts, setOpts] = React.useState(() => api.settings.get(OPTS_KEY, DEFAULT_OPTIONS));
 	const [userPresets, setUserPresets] = React.useState(() => api.settings.get(PRESETS_KEY, []));
 	const [applying, setApplying] = React.useState(false);
@@ -1249,12 +976,12 @@ function RenameTab() {
 			setProg(null);
 		}
 	};
-	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: "Template" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(TextInput, {
+	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: "Template" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement("div", { title: "Click a token below to add it. Anything else is kept as typed." }, /* @__PURE__ */ React.createElement(TextInput, {
 		value: opts.template,
 		onChange: (v) => set({ template: v }),
 		style: { fontFamily: tokens.fontMono },
 		placeholder: "{name}_{seq}"
-	}), /* @__PURE__ */ React.createElement(Hint, null, "Click to add a token. Anything else is kept as typed."), TOKEN_GROUPS.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.group }, /* @__PURE__ */ React.createElement("div", { style: {
+	})), api.naming.tokens.map((g) => /* @__PURE__ */ React.createElement("div", { key: g.group }, /* @__PURE__ */ React.createElement("div", { style: {
 		color: tokens.textMuted,
 		fontSize: 10,
 		textTransform: "uppercase",
@@ -1286,20 +1013,20 @@ function RenameTab() {
 		onChange: (v) => set({ seqStart: Math.trunc(v) }),
 		min: 0,
 		step: 1,
-		width: 64
+		width: "64px"
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Step" }, /* @__PURE__ */ React.createElement(NumberInput, {
 		value: opts.seqStep,
 		onChange: (v) => set({ seqStep: Math.trunc(v) || 1 }),
 		min: 1,
 		step: 1,
-		width: 64
+		width: "64px"
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Digits" }, /* @__PURE__ */ React.createElement(NumberInput, {
 		value: opts.seqPad,
 		onChange: (v) => set({ seqPad: Math.max(1, Math.trunc(v)) }),
 		min: 1,
 		max: 8,
 		step: 1,
-		width: 64
+		width: "64px"
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Case" }, /* @__PURE__ */ React.createElement(SegmentedControl, {
 		value: opts.caseMode,
 		onChange: (v) => set({ caseMode: v }),
@@ -1346,7 +1073,7 @@ function RenameTab() {
 		size: "sm",
 		variant: "danger",
 		onClick: deletePreset
-	}, "Delete")))), /* @__PURE__ */ React.createElement(Section, { title: `Preview (${active.length} to rename)` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Select one or more photos in the grid."), plan.unknownTokens.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, "Unknown token", plan.unknownTokens.length > 1 ? "s" : "", ": ", plan.unknownTokens.map((t) => `{${t}}`).join(", "), " — resolved to nothing."), readingSubsec && /* @__PURE__ */ React.createElement(Hint, null, "Reading subsecond timestamps…"), noSubsecData && /* @__PURE__ */ React.createElement(Hint, null, "None of the selected files carry subsecond EXIF — ", "{subsec}", " resolves to nothing."), plan.duplicates.length > 0 && !readingSubsec && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, "Template produces duplicate names (add ", "{seq}", " or ", "{letter}", "): ", plan.duplicates.slice(0, 3).join(", "), plan.duplicates.length > 3 ? "…" : ""), plan.needsTempPass && active.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "Names overlap the current set — a safe two-pass rename will be used."), active.length > 0 && /* @__PURE__ */ React.createElement("div", { style: {
+	}, "Delete")))), /* @__PURE__ */ React.createElement(Section, { title: `Preview (${active.length} to rename)` }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Status, null, "Select one or more photos in the grid."), plan.unknownTokens.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, "Unknown token", plan.unknownTokens.length > 1 ? "s" : "", ": ", plan.unknownTokens.map((t) => `{${t}}`).join(", "), " — resolved to nothing."), readingSubsec && /* @__PURE__ */ React.createElement(Status, null, "Reading subsecond timestamps…"), noSubsecData && /* @__PURE__ */ React.createElement(Status, null, "None of the selected files carry subsecond EXIF — ", "{subsec}", " resolves to nothing."), plan.duplicates.length > 0 && !readingSubsec && /* @__PURE__ */ React.createElement(Notice, { tone: "danger" }, "Template produces duplicate names (add ", "{seq}", " or ", "{letter}", "): ", plan.duplicates.slice(0, 3).join(", "), plan.duplicates.length > 3 ? "…" : ""), plan.needsTempPass && active.length > 0 && /* @__PURE__ */ React.createElement(Notice, { tone: "info" }, "Names overlap the current set — a safe two-pass rename will be used."), active.length > 0 && /* @__PURE__ */ React.createElement("div", { style: {
 		fontFamily: tokens.fontMono,
 		fontSize: 11,
 		lineHeight: 1.7
@@ -1367,7 +1094,7 @@ function RenameTab() {
 		color: tokens.textPrimary,
 		overflow: "hidden",
 		textOverflow: "ellipsis"
-	} }, it.newName))), active.length > PREVIEW_LIMIT && /* @__PURE__ */ React.createElement("div", { style: { color: tokens.textMuted } }, "…and ", active.length - PREVIEW_LIMIT, " more")), skipped.length > 0 && /* @__PURE__ */ React.createElement(Hint, null, skipped.length, " skipped: ", skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; "), skipped.length > 3 ? "…" : ""))), prog && /* @__PURE__ */ React.createElement(ProgressBar, { value: prog.total ? prog.done / prog.total : 0 }), summary && /* @__PURE__ */ React.createElement(Notice, { tone: summary.failed.length ? "warn" : "ok" }, "Renamed ", summary.renamed, summary.skipped.length ? `, skipped ${summary.skipped.length}` : "", summary.failed.length ? `, failed ${summary.failed.length}: ${summary.failed.slice(0, 2).map((f) => f.reason).join("; ")}` : "."), /* @__PURE__ */ React.createElement(Button, {
+	} }, it.newName))), active.length > PREVIEW_LIMIT && /* @__PURE__ */ React.createElement("div", { style: { color: tokens.textMuted } }, "…and ", active.length - PREVIEW_LIMIT, " more")), skipped.length > 0 && /* @__PURE__ */ React.createElement(Status, null, skipped.length, " skipped: ", skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; "), skipped.length > 3 ? "…" : ""))), prog && /* @__PURE__ */ React.createElement(ProgressBar, { value: prog.total ? prog.done / prog.total : 0 }), summary && /* @__PURE__ */ React.createElement(Notice, { tone: summary.failed.length ? "warn" : "ok" }, "Renamed ", summary.renamed, summary.skipped.length ? `, skipped ${summary.skipped.length}` : "", summary.failed.length ? `, failed ${summary.failed.length}: ${summary.failed.slice(0, 2).map((f) => f.reason).join("; ")}` : "."), /* @__PURE__ */ React.createElement(Button, {
 		variant: "primary",
 		full: true,
 		disabled: !canApply,
@@ -2604,9 +2331,10 @@ function toExifDate(s) {
 	return Number.isNaN(d.getTime()) ? null : formatExifDate(d);
 }
 const READ_LIMIT = 1 << 20;
+const TOKENS_TIP = "Text fields take the rename tokens, filled in for each photo: {date}, {yyyy}, {mon}, {day}, {name}, {seq}, {folder}, {make}, {model}, {lens}…";
 function MetadataTab() {
 	const { Button, TextInput, TextArea, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, Toggle, tokens } = ui;
-	const targets = useSelectedPhotos();
+	const targets = api.catalog.useTargetPhotos();
 	const single = targets.length === 1;
 	const firstId = targets[0]?.id;
 	const [values, setValues] = React.useState(emptyForm);
@@ -2787,7 +2515,7 @@ function MetadataTab() {
 		});
 	};
 	const groupTouched = (g) => IPTC_FIELDS.some((f) => f.group === g && touched[f.key]);
-	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: targets.length > 1 ? `Edit metadata (${targets.length} photos)` : "Edit metadata" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Select one or more photos in the grid."), targets.length > 1 && /* @__PURE__ */ React.createElement(Hint, null, "Only the fields you change are written. Empty a field to clear it."), /* @__PURE__ */ React.createElement(Field, { label: "Creator" }, /* @__PURE__ */ React.createElement(TextInput, {
+	return /* @__PURE__ */ React.createElement(Stack, { gap: 12 }, /* @__PURE__ */ React.createElement(Section, { title: targets.length > 1 ? `Edit metadata (${targets.length} photos)` : "Edit metadata" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, targets.length === 0 && /* @__PURE__ */ React.createElement(Status, null, "Select one or more photos in the grid."), /* @__PURE__ */ React.createElement("div", { title: TOKENS_TIP }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(Field, { label: "Creator" }, /* @__PURE__ */ React.createElement(TextInput, {
 		value: values.artist,
 		onChange: (v) => setField("artist", v),
 		placeholder: keep
@@ -2800,18 +2528,12 @@ function MetadataTab() {
 		onChange: (v) => setField("description", v),
 		rows: 2,
 		placeholder: keep
-	})), /* @__PURE__ */ React.createElement(Field, {
-		label: "Keywords",
-		hint: "Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files."
-	}, /* @__PURE__ */ React.createElement(TextArea, {
+	})))), /* @__PURE__ */ React.createElement("div", { title: "Comma-separated. Kept in the catalogue and .xmp sidecars, not written into JPEG or TIFF files." }, /* @__PURE__ */ React.createElement(Field, { label: "Keywords" }, /* @__PURE__ */ React.createElement(TextArea, {
 		value: values.keywords,
 		onChange: (v) => setField("keywords", v),
 		rows: 2,
 		placeholder: single ? "sunset, coast" : keep
-	})), /* @__PURE__ */ React.createElement(Field, {
-		label: "IPTC",
-		hint: "Kept in the .xmp sidecar for every format; the original file is never changed for these."
-	}, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
+	}))), /* @__PURE__ */ React.createElement("div", { title: `Kept in the .xmp sidecar for every format; the original file is never changed for these. ${TOKENS_TIP}` }, /* @__PURE__ */ React.createElement(Field, { label: "IPTC" }, /* @__PURE__ */ React.createElement(Stack, { gap: 8 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
 		value: group,
 		onChange: (v) => setGroup(v),
 		options: IPTC_GROUPS.map((g) => ({
@@ -2821,7 +2543,7 @@ function MetadataTab() {
 	}), IPTC_FIELDS.filter((f) => f.group === group).map((f) => /* @__PURE__ */ React.createElement(Field, {
 		key: f.key,
 		label: f.label
-	}, iptcInput(f))), iptcErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, iptcErr))), /* @__PURE__ */ React.createElement(Hint, null, "Text fields take the rename tokens, filled in for each photo: ", "{date}", ", ", "{yyyy}", ", ", "{mon}", ", ", "{day}", ", ", "{name}", ",", " {seq}", ", ", "{folder}", ", ", "{make}", ", ", "{model}", ", ", "{lens}", "…"), /* @__PURE__ */ React.createElement(Field, { label: "Capture time" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
+	}, iptcInput(f))), iptcErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, iptcErr)))), /* @__PURE__ */ React.createElement(Field, { label: "Capture time" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(SegmentedControl, {
 		value: dateMode,
 		onChange: (v) => setDateMode(v),
 		options: [
@@ -2849,14 +2571,14 @@ function MetadataTab() {
 		min: -72,
 		max: 72,
 		step: 1,
-		width: 64
+		width: "64px"
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Minutes" }, /* @__PURE__ */ React.createElement(NumberInput, {
 		value: shiftM,
 		onChange: setShiftM,
 		min: -59,
 		max: 59,
 		step: 1,
-		width: 64
+		width: "64px"
 	}))))), /* @__PURE__ */ React.createElement(Field, { label: "GPS" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Toggle, {
 		checked: gpsOn,
 		onChange: setGpsOn,
@@ -2867,14 +2589,14 @@ function MetadataTab() {
 		min: -90,
 		max: 90,
 		step: 1e-4,
-		width: 100
+		width: "100px"
 	})), /* @__PURE__ */ React.createElement(Field, { label: "Longitude" }, /* @__PURE__ */ React.createElement(NumberInput, {
 		value: lon,
 		onChange: setLon,
 		min: -180,
 		max: 180,
 		step: 1e-4,
-		width: 100
+		width: "100px"
 	}))))), prog && /* @__PURE__ */ React.createElement(ProgressBar, { value: prog.total ? prog.done / prog.total : 0 }), results && /* @__PURE__ */ React.createElement(Notice, { tone: failed.length ? "warn" : "ok" }, "Wrote ", inPlace, " in place", sidecar ? `, ${sidecar} to sidecar` : "", failed.length ? `, ${failed.length} failed: ${failed.slice(0, 2).map((f) => f.reason).join("; ")}` : ".", results.some((r) => r.mode === "sidecar" && r.reason?.startsWith("In-place")) && /* @__PURE__ */ React.createElement("div", { style: {
 		marginTop: 4,
 		color: tokens.textMuted
@@ -2882,8 +2604,9 @@ function MetadataTab() {
 		variant: "primary",
 		full: true,
 		disabled: !canApply,
-		onClick: run
-	}, applying ? "Writing…" : `Apply to ${targets.length || ""} photo${targets.length === 1 ? "" : "s"}`))), /* @__PURE__ */ React.createElement(Section, { title: "Templates" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement(Select, {
+		onClick: run,
+		title: targets.length > 1 ? "Only the fields you change are written. Empty a field to clear it." : void 0
+	}, applying ? "Writing…" : `Apply to ${targets.length || ""} photo${targets.length === 1 ? "" : "s"}`))), /* @__PURE__ */ React.createElement(Section, { title: "Templates" }, /* @__PURE__ */ React.createElement(Stack, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { title: "A template fills in its fields; Apply writes them. Tokens such as {date} stay tokens until then." }, /* @__PURE__ */ React.createElement(Select, {
 		value: "",
 		onChange: loadTemplate,
 		placeholder: templates.length ? "Fill in from a template…" : "No templates yet",
@@ -2892,7 +2615,7 @@ function MetadataTab() {
 			value: t.name,
 			label: t.name
 		}))
-	}), /* @__PURE__ */ React.createElement(Row, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement(TextInput, {
+	})), /* @__PURE__ */ React.createElement(Row, { gap: 6 }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1 } }, /* @__PURE__ */ React.createElement(TextInput, {
 		value: templateName,
 		onChange: setTemplateName,
 		placeholder: "Save filled-in fields as…"
@@ -2904,7 +2627,7 @@ function MetadataTab() {
 		size: "sm",
 		variant: "danger",
 		onClick: deleteTemplate
-	}, "Delete")), /* @__PURE__ */ React.createElement(Hint, null, "A template fills in its fields; Apply writes them. Tokens such as ", "{date}", " stay tokens until then."))), /* @__PURE__ */ React.createElement(Section, { title: single ? "Inspector" : "Inspector (first selected)" }, targets.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "Nothing selected."), targets.length > 0 && dumpErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, dumpErr), targets.length > 0 && !dumpErr && dump === null && /* @__PURE__ */ React.createElement(Hint, null, "Reading…"), dump !== null && dump.length === 0 && /* @__PURE__ */ React.createElement(Hint, null, "No EXIF metadata found in this file."), dump !== null && dump.length > 0 && /* @__PURE__ */ React.createElement(TagDump, { rows: dump })));
+	}, "Delete")))), /* @__PURE__ */ React.createElement(Section, { title: single ? "Inspector" : "Inspector (first selected)" }, targets.length === 0 && /* @__PURE__ */ React.createElement(Status, null, "Nothing selected."), targets.length > 0 && dumpErr && /* @__PURE__ */ React.createElement(Notice, { tone: "warn" }, dumpErr), targets.length > 0 && !dumpErr && dump === null && /* @__PURE__ */ React.createElement(Status, null, "Reading…"), dump !== null && dump.length === 0 && /* @__PURE__ */ React.createElement(Status, null, "No EXIF metadata found in this file."), dump !== null && dump.length > 0 && /* @__PURE__ */ React.createElement(TagDump, { rows: dump })));
 }
 function TagDump({ rows }) {
 	const { tokens } = ui;
@@ -3054,11 +2777,7 @@ function activate(api) {
 			width: 300
 		}
 	});
-	const open = (ids, tab) => {
-		if (ids.length) api.stores.useCatalogStore.setState({
-			selectedIds: new Set(ids),
-			activePhotoId: ids[0]
-		});
+	const open = (tab) => {
 		requestTab(tab);
 		api.dock.togglePanel(PANEL_ID);
 	};
@@ -3066,13 +2785,13 @@ function activate(api) {
 		id: `${ID}.rename`,
 		label: (ids) => ids.length > 1 ? `Batch rename… (${ids.length})` : "Rename with template…",
 		order: 10,
-		onClick: (ids) => open(ids, "rename")
+		onClick: () => open("rename")
 	});
 	api.registerGridMenuItem({
 		id: `${ID}.metadata`,
 		label: (ids) => ids.length > 1 ? `Edit metadata… (${ids.length})` : "Edit metadata…",
 		order: 11,
-		onClick: (ids) => open(ids, "metadata")
+		onClick: () => open("metadata")
 	});
 	api.registerCatalogHooks({
 		id: `${ID}.sidecar`,

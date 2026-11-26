@@ -1,7 +1,7 @@
 // The editable metadata model — the fields the editor exposes, plus the helpers
 // that convert between the app's display forms and the EXIF/XMP wire forms.
 
-import type { CatalogPhoto } from "../safelight-api";
+import type { CatalogPhoto } from "../safelight";
 import { expandTokens } from "../rename/engine";
 import type { IptcValues } from "./iptc";
 

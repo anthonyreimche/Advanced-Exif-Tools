@@ -28,6 +28,8 @@ two-pass rename so nothing collides.
 | `{make}` `{model}` `{lens}` | Camera & lens | `NIKON` `Z8` |
 | `{iso}` `{fnum}` `{shutter}` `{focal}` | Exposure | `400` `f2.8` `1_250` `35mm` |
 
+Renaming uses Safelight's shared naming tokens, so it needs Safelight 3.2.8.
+
 Sequence **start**, **step**, zero-pad **digits**, and a **case** transform are
 set in the panel, and named **presets** can be saved.
 

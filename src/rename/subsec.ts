@@ -5,7 +5,7 @@
 
 import { parseTiff, getAscii } from "../metadata/tiff";
 import { findExifBase } from "../metadata/exif-read";
-import type { CatalogPhoto } from "../safelight-api";
+import type { CatalogPhoto } from "../safelight";
 
 const TAG_SUBSEC = 0x9290;
 const TAG_SUBSEC_ORIGINAL = 0x9291;

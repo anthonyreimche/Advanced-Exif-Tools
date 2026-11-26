@@ -2,7 +2,7 @@
 // XMP packet and IPTC-IIM, the two forms picture desks and wire services read.
 // Off unless turned on in the Export panel, like core's own metadata option.
 
-import type { CatalogPhoto, ExportProcessorField } from "../safelight-api";
+import type { CatalogPhoto, ExportProcessorField } from "../safelight";
 import type { EditableMeta } from "./model";
 import { readIptc } from "./apply";
 import { buildIim } from "./iptc";

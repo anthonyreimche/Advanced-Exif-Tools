@@ -2,9 +2,9 @@
 // result across the selection, and apply it through core's atomic rename.
 
 import { React, api, ui } from "../rt";
-import { useSelectedPhotos, Hint, Notice } from "../ui";
+import { Status, Notice } from "../ui";
 import {
-  planRename, templateUsesSubsec, TOKEN_GROUPS, DEFAULT_OPTIONS,
+  planRename, templateUsesSubsec, DEFAULT_OPTIONS,
   type RenameOptions, type CaseMode,
 } from "./engine";
 import { harvestSubsec, missingSubsec, subsecMap } from "./subsec";
@@ -30,7 +30,7 @@ const PREVIEW_LIMIT = 8;
 
 export function RenameTab(): React.ReactElement {
   const { Button, TextInput, NumberInput, SegmentedControl, Select, Section, Field, Row, Stack, ProgressBar, tokens } = ui;
-  const targets = useSelectedPhotos();
+  const targets = api.catalog.useTargetPhotos();
 
   const [opts, setOpts] = React.useState<RenameOptions>(() =>
     api.settings.get<RenameOptions>(OPTS_KEY, DEFAULT_OPTIONS),
@@ -127,14 +127,15 @@ export function RenameTab(): React.ReactElement {
     <Stack gap={12}>
       <Section title="Template">
         <Stack gap={8}>
-          <TextInput
-            value={opts.template}
-            onChange={(v) => set({ template: v })}
-            style={{ fontFamily: tokens.fontMono }}
-            placeholder="{name}_{seq}"
-          />
-          <Hint>Click to add a token. Anything else is kept as typed.</Hint>
-          {TOKEN_GROUPS.map((g) => (
+          <div title="Click a token below to add it. Anything else is kept as typed.">
+            <TextInput
+              value={opts.template}
+              onChange={(v) => set({ template: v })}
+              style={{ fontFamily: tokens.fontMono }}
+              placeholder="{name}_{seq}"
+            />
+          </div>
+          {api.naming.tokens.map((g) => (
             <div key={g.group}>
               <div style={{ color: tokens.textMuted, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 4 }}>
                 {g.group}
@@ -169,13 +170,13 @@ export function RenameTab(): React.ReactElement {
       <Section title="Numbering">
         <Row gap={10} wrap>
           <Field label="Start">
-            <NumberInput value={opts.seqStart} onChange={(v) => set({ seqStart: Math.trunc(v) })} min={0} step={1} width={64} />
+            <NumberInput value={opts.seqStart} onChange={(v) => set({ seqStart: Math.trunc(v) })} min={0} step={1} width="64px" />
           </Field>
           <Field label="Step">
-            <NumberInput value={opts.seqStep} onChange={(v) => set({ seqStep: Math.trunc(v) || 1 })} min={1} step={1} width={64} />
+            <NumberInput value={opts.seqStep} onChange={(v) => set({ seqStep: Math.trunc(v) || 1 })} min={1} step={1} width="64px" />
           </Field>
           <Field label="Digits">
-            <NumberInput value={opts.seqPad} onChange={(v) => set({ seqPad: Math.max(1, Math.trunc(v)) })} min={1} max={8} step={1} width={64} />
+            <NumberInput value={opts.seqPad} onChange={(v) => set({ seqPad: Math.max(1, Math.trunc(v)) })} min={1} max={8} step={1} width="64px" />
           </Field>
           <Field label="Case">
             <SegmentedControl
@@ -218,14 +219,14 @@ export function RenameTab(): React.ReactElement {
 
       <Section title={`Preview (${active.length} to rename)`}>
         <Stack gap={8}>
-          {targets.length === 0 && <Hint>Select one or more photos in the grid.</Hint>}
+          {targets.length === 0 && <Status>Select one or more photos in the grid.</Status>}
 
           {plan.unknownTokens.length > 0 && (
             <Notice tone="warn">Unknown token{plan.unknownTokens.length > 1 ? "s" : ""}: {plan.unknownTokens.map((t) => `{${t}}`).join(", ")} — resolved to nothing.</Notice>
           )}
-          {readingSubsec && <Hint>Reading subsecond timestamps…</Hint>}
+          {readingSubsec && <Status>Reading subsecond timestamps…</Status>}
           {noSubsecData && (
-            <Hint>None of the selected files carry subsecond EXIF — {"{subsec}"} resolves to nothing.</Hint>
+            <Status>None of the selected files carry subsecond EXIF — {"{subsec}"} resolves to nothing.</Status>
           )}
           {plan.duplicates.length > 0 && !readingSubsec && (
             <Notice tone="danger">Template produces duplicate names (add {"{seq}"} or {"{letter}"}): {plan.duplicates.slice(0, 3).join(", ")}{plan.duplicates.length > 3 ? "…" : ""}</Notice>
@@ -248,7 +249,7 @@ export function RenameTab(): React.ReactElement {
           )}
 
           {skipped.length > 0 && (
-            <Hint>{skipped.length} skipped: {skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; ")}{skipped.length > 3 ? "…" : ""}</Hint>
+            <Status>{skipped.length} skipped: {skipped.slice(0, 3).map((s) => `${s.oldName} (${s.skip})`).join("; ")}{skipped.length > 3 ? "…" : ""}</Status>
           )}
         </Stack>
       </Section>

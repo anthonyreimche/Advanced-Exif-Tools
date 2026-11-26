@@ -10,8 +10,8 @@ import { upsertXmp, readXmp, sidecarName, legacySidecarName, isOwnPacket } from 
 import { writeSidecar, readSidecarForImport, applyMetadata } from "../src/metadata/apply";
 import { readAllTags } from "../src/metadata/exif-read";
 import {
-  planRename, renderTemplate, collectUnknownTokens, templateUsesSubsec,
-  DEFAULT_OPTIONS, TOKEN_GROUPS, type RenamePlan,
+  planRename, renderTemplate, templateUsesSubsec,
+  DEFAULT_OPTIONS, type RenamePlan,
 } from "../src/rename/engine";
 import { applyRename } from "../src/rename/apply";
 import { extractSubsec } from "../src/rename/subsec";
@@ -25,8 +25,16 @@ import {
   type FormTouched,
 } from "../src/metadata/form";
 import { expandTokens } from "../src/rename/engine";
+import { renderName, renderFolder, expandName, unknownTokens, NAME_TOKENS } from "../../../SafeLight/src/catalog/naming";
 import { initRuntime } from "../src/rt";
-import type { CatalogPhoto, RenamePhotoResult, SafelightAPI } from "../src/safelight-api";
+import { activate } from "../src/index";
+import { RenameTab } from "../src/rename/RenameTab";
+import { MetadataTab } from "../src/metadata/MetadataTab";
+import { Notice } from "../src/ui";
+import type { CatalogPhoto, RenamePhotoResult, SafelightAPI } from "../src/safelight";
+
+/** Core's real naming engine, as the host hands it to an extension. */
+const coreNaming = { tokens: NAME_TOKENS, render: renderName, renderFolder, expand: expandName, unknownTokens };
 
 let passed = 0;
 let failed = 0;
@@ -38,6 +46,92 @@ function ok(name: string, cond: boolean, detail = ""): void {
     failed++;
     console.log(`  ✗ ${name} ${detail}`);
   }
+}
+
+// ── the panel against a stand-in host: a React stub that runs a component once
+// (state at its initial value, effects not run) and returns the element tree.
+
+interface Drawn {
+  type: unknown;
+  props: Record<string, unknown> | null;
+  children: unknown[];
+}
+
+const fakeReact = {
+  createElement: (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): Drawn => ({ type, props, children }),
+  useState: <T,>(init: T | (() => T)) => [typeof init === "function" ? (init as () => T)() : init, () => undefined],
+  useMemo: <T,>(fn: () => T) => fn(),
+  useRef: <T,>(current: T) => ({ current }),
+  useEffect: () => undefined,
+  Fragment: "fragment",
+};
+
+const TOKENS = { rating: "T:rating", labelRed: "T:red", labelGreen: "T:green", textSecondary: "T:secondary", textMuted: "T:muted", textPrimary: "T:primary", fontMono: "T:mono" };
+
+/** Every string drawn as text, and every title, in the tree. */
+function drawnText(node: unknown, out: { text: string[]; titles: string[] } = { text: [], titles: [] }) {
+  if (typeof node === "string") out.text.push(node);
+  else if (Array.isArray(node)) for (const n of node) drawnText(n, out);
+  else if (node && typeof node === "object" && "children" in node) {
+    const d = node as Drawn;
+    if (typeof d.props?.title === "string") out.titles.push(d.props.title);
+    if (typeof d.props?.hint === "string") out.text.push(d.props.hint);
+    drawnText(d.children, out);
+  }
+  return out;
+}
+
+function panelHost(targets: CatalogPhoto[]) {
+  const writes: unknown[] = [];
+  const toggled: string[] = [];
+  const menus: { onClick(ids: string[]): void }[] = [];
+  const settings = new Map<string, unknown>([["rename.options", { ...DEFAULT_OPTIONS, template: "{name}_{seq}" }]]);
+  const api = {
+    react: fakeReact,
+    naming: coreNaming,
+    ui: { tokens: TOKENS },
+    settings: {
+      get: <T,>(k: string, fb: T): T => (settings.has(k) ? (settings.get(k) as T) : fb),
+      set: (k: string, v: unknown) => void settings.set(k, v),
+    },
+    stores: { useCatalogStore: { setState: (s: unknown) => void writes.push(s) } },
+    catalog: { useTargetPhotos: () => targets },
+    dock: { togglePanel: (id: string) => void toggled.push(id) },
+    registerPanel: () => undefined,
+    registerGridMenuItem: (c: { onClick(ids: string[]): void }) => void menus.push(c),
+    registerCatalogHooks: () => undefined,
+    registerExportProcessor: () => undefined,
+  };
+  return { api: api as unknown as SafelightAPI, writes, toggled, menus };
+}
+
+function testPanelSeams(): void {
+  console.log("Panel on core's seams:");
+  const two = [fakePhoto({ id: "1", filename: "a.JPG" }), fakePhoto({ id: "2", filename: "b.JPG" })];
+
+  const host = panelHost(two);
+  activate(host.api);
+  host.menus[0].onClick(["1", "2"]);
+  ok("grid menu leaves the selection to core", host.writes.length === 0, JSON.stringify(host.writes));
+  ok("grid menu opens the panel", host.toggled.length === 1);
+
+  const rename = drawnText(RenameTab());
+  ok("rename previews core's target photos", rename.titles.includes("Preview (2 to rename)"), JSON.stringify(rename.titles));
+  ok("rename explains its tokens in a tooltip, not text",
+    rename.titles.some((t) => t.includes("Anything else is kept as typed")) && !rename.text.some((t) => t.includes("Anything else is kept as typed")));
+
+  const meta = drawnText(MetadataTab());
+  ok("metadata edits core's target photos", JSON.stringify(MetadataTab()).includes("Edit metadata (2 photos)"));
+  const tips = ["Only the fields you change are written", "take the rename tokens", "A template fills in its fields", "Comma-separated", "Kept in the .xmp sidecar"];
+  ok("metadata explains its fields in tooltips, not text",
+    tips.every((tip) => meta.titles.some((t) => t.includes(tip)) && !meta.text.some((t) => t.includes(tip))),
+    JSON.stringify(meta.text.filter((t) => tips.some((tip) => t.includes(tip)))));
+
+  initRuntime(panelHost([]).api);
+  ok("no target photos is said in the panel", drawnText(RenameTab()).text.includes("Select one or more photos in the grid."));
+
+  const edge = (tone: "warn" | "danger" | "ok") => String((Notice({ tone, children: "x" }) as unknown as Drawn).props?.style && ((Notice({ tone, children: "x" }) as unknown as Drawn).props!.style as { borderLeft: string }).borderLeft);
+  ok("notices take the theme's rating, red and green", edge("warn").includes("T:rating") && edge("danger").includes("T:red") && edge("ok").includes("T:green"));
 }
 
 // ── build a minimal little-endian TIFF with a 4-byte "pixel" strip ───────────
@@ -298,6 +392,7 @@ function fakePhoto(over: Partial<CatalogPhoto>): CatalogPhoto {
 
 function testRename(): void {
   console.log("Rename planner:");
+  initRuntime({ naming: coreNaming } as unknown as SafelightAPI);
   const photos = [
     fakePhoto({ id: "1", filename: "a.NEF", folder: "T", exif: { cameraModel: "Z8", dateTimeOriginal: "2026:06:30 14:05:42" } }),
     fakePhoto({ id: "2", filename: "b.NEF", folder: "T", exif: { cameraModel: "Z8", dateTimeOriginal: "2026:06:30 14:06:00" } }),
@@ -336,6 +431,7 @@ function buildSubsecTiff(tags: { tag: number; value: string }[]): Uint8Array {
 
 function testSubsec(): void {
   console.log("Subsecond token:");
+  initRuntime({ naming: coreNaming } as unknown as SafelightAPI);
   const burstShot = (id: string, name: string) =>
     fakePhoto({ id, filename: name, folder: "T", exif: { dateTimeOriginal: "2026:07:15 12:08:41" } });
   const opts = { ...DEFAULT_OPTIONS, template: "{yyyy}{mon}{day}_{hour}{min}{sec}.{subsec}" };
@@ -348,10 +444,16 @@ function testSubsec(): void {
   ok("width arg widens", renderTemplate(burstShot("1", "a.NEF"), 0, { ...opts, template: "{sec}.{subsec:6}" }, subsec) === "41.541000");
   ok("missing subsec leaves a clean name", renderTemplate(burstShot("4", "d.NEF"), 3, opts, subsec) === "20260715_120841");
   ok("no map behaves like missing", renderTemplate(burstShot("1", "a.NEF"), 0, opts) === "20260715_120841");
-  ok("subsec is a known token", collectUnknownTokens("{subsec}").length === 0);
+  const catalogued = fakePhoto({ id: "9", filename: "e.NEF", exif: { dateTimeOriginal: "2026:07:15 12:08:41", subSecTimeOriginal: "25" } });
+  ok("catalogue subsec is the fallback", renderTemplate(catalogued, 0, opts) === "20260715_120841.250");
+  ok("harvested subsec wins", renderTemplate(catalogued, 0, opts, new Map([["9", "7"]])) === "20260715_120841.700");
+  ok("folder is the directory handle's name", renderTemplate(fakePhoto({ filename: "x.JPG", directoryHandle: { name: "Root" } as unknown as FileSystemDirectoryHandle }), 0, { ...opts, template: "{folder}" }) === "Root");
+  ok("folder falls back to the last path segment", renderTemplate(fakePhoto({ filename: "x.JPG", folder: "A/B" }), 0, { ...opts, template: "{folder}" }) === "B");
+  ok("numbering and case reach core", renderTemplate(fakePhoto({ filename: "x.JPG" }), 2, { ...opts, template: "{name}{seq}", seqStart: 10, seqStep: 5, seqPad: 4, caseMode: "upper" }) === "X0020");
+  ok("subsec is a known token", unknownTokens("{subsec}").length === 0);
   ok("template probe positive", templateUsesSubsec("x_{subsec:2}_y"));
   ok("template probe negative", !templateUsesSubsec("{sec}_{seq}"));
-  ok("palette offers subsec", TOKEN_GROUPS.some((g) => g.tokens.some((t) => t.insert === "{subsec}")));
+  ok("palette offers subsec", NAME_TOKENS.some((g) => g.tokens.some((t) => t.insert === "{subsec}")));
 
   // A same-second burst is exactly what the token exists for: distinct
   // subseconds must clear the duplicate-name gate that blocks Apply.
@@ -470,6 +572,7 @@ function installFakeApi(
     },
   };
   initRuntime({
+    naming: coreNaming,
     stores: { useCatalogStore: { getState: () => state } },
     catalog: { renamePhoto },
   } as unknown as SafelightAPI);
@@ -825,6 +928,7 @@ function testJpegEmbed(): void {
 
 function testCaptionTokens(): void {
   console.log("Caption variables:");
+  initRuntime({ naming: coreNaming } as unknown as SafelightAPI);
   const p = fakePhoto({
     filename: "DSC_0042.NEF",
     exif: { dateTimeOriginal: "2026:06:30 14:05:42", shutterSpeed: "1/250", cameraModel: "Z8" },
@@ -978,5 +1082,6 @@ testCaptionTokens();
 testTemplates();
 await testIptcApply();
 await testExportEmbed();
+testPanelSeams();
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) throw new Error(`${failed} checks failed`);

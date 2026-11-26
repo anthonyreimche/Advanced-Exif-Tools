@@ -2,7 +2,7 @@
 // shortcuts, and the XMP-sidecar import hook onto the scoped Safelight API.
 
 import { initRuntime } from "./rt";
-import type { SafelightAPI } from "./safelight-api";
+import type { SafelightAPI } from "./safelight";
 import { ToolsPanel, requestTab, type PanelTab } from "./Panel";
 import { readSidecarForImport } from "./metadata/apply";
 import { EXPORT_SETTINGS, embedForExport } from "./metadata/export";
@@ -20,12 +20,9 @@ export function activate(api: SafelightAPI): void {
     defaultDock: { module: "library", direction: "right", order: 20, width: 300 },
   });
 
-  // Target exactly the right-clicked photos (or the selection they belong to),
-  // then surface the panel on the matching tab.
-  const open = (ids: string[], tab: PanelTab) => {
-    if (ids.length) {
-      api.stores.useCatalogStore.setState({ selectedIds: new Set(ids), activePhotoId: ids[0] });
-    }
+  // Core's grid menu has already selected the right-clicked photos (or kept the
+  // selection they belong to); surface the panel on the matching tab.
+  const open = (tab: PanelTab) => {
     requestTab(tab);
     api.dock.togglePanel(PANEL_ID);
   };
@@ -34,14 +31,14 @@ export function activate(api: SafelightAPI): void {
     id: `${ID}.rename`,
     label: (ids) => (ids.length > 1 ? `Batch rename… (${ids.length})` : "Rename with template…"),
     order: 10,
-    onClick: (ids) => open(ids, "rename"),
+    onClick: () => open("rename"),
   });
 
   api.registerGridMenuItem({
     id: `${ID}.metadata`,
     label: (ids) => (ids.length > 1 ? `Edit metadata… (${ids.length})` : "Edit metadata…"),
     order: 11,
-    onClick: (ids) => open(ids, "metadata"),
+    onClick: () => open("metadata"),
   });
 
   // Fold any XMP sidecar we wrote (for RAW/other) back onto the record on scan.
